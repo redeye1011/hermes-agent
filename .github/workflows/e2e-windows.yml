@@ -16,7 +16,13 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout cache inputs
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            package-lock.json
+            apps/bootstrap-installer
+          sparse-checkout-cone-mode: true
 
       # The cache key is the exact installer build fingerprint. A hit means
       # this package-lock + bootstrap-installer source combo was already built,
@@ -42,6 +48,10 @@ jobs:
       - name: Install npm dependencies
         if: steps.installer-cache.outputs.cache-hit != 'true'
         run: npm ci
+
+      - name: checkout full tree on cache miss
+        if: steps.installer-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
 
       - name: Cache Rust targets
         if: steps.installer-cache.outputs.cache-hit != 'true'
