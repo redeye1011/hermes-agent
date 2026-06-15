@@ -1,0 +1,214 @@
+name: E2E — Windows Desktop
+
+on:
+  push:
+    branches: [ethie/e2e]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      # Isolated install directory so the real install flow doesn't touch the
+      # runner's user profile. Kept under the workspace for easy cleanup.
+      HERMES_HOME: ${{ github.workspace }}\.e2e-hermes-home
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+
+      - name: Cache Rust targets
+        uses: Swatinem/rust-cache@c106961feec855ef5a58494c5a2a31c9d80429a9
+        with:
+          workspaces: apps/bootstrap-installer/src-tauri
+
+      # ── Build the bootstrap installer (Tauri) ──────────────────────
+      - name: Build installer
+        run: npm run tauri:build
+        working-directory: apps/bootstrap-installer
+        timeout-minutes: 2
+        env:
+          # Pin the installer to the exact commit being tested so that the
+          # install script checks out this PR/code rather than remote main.
+          HERMES_BUILD_PIN_COMMIT: ${{ github.sha }}
+
+      # ── Stage the real installer binary as a user download ──────────
+      - name: Stage Hermes-Setup.exe in Downloads
+        shell: pwsh
+        run: |
+          $downloads = [Environment]::GetFolderPath('UserProfile') + '\Downloads'
+          New-Item -ItemType Directory -Path $downloads -Force | Out-Null
+
+          $candidates = @(
+            'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes.exe',
+            'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes_0.0.1_x64.exe',
+            'apps/bootstrap-installer/src-tauri/target/release/bundle/app/Hermes_0.0.1_x64-setup.exe',
+            'apps/bootstrap-installer/src-tauri/target/release/Hermes.exe'
+          )
+          $installer = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) {
+              $installer = Resolve-Path $c
+              break
+            }
+          }
+          if (-not $installer) {
+            $installer = Get-ChildItem -Path 'apps/bootstrap-installer/src-tauri/target/release' `
+              -Recurse -Filter '*.exe' | Where-Object { $_.Name -notlike '*setup*' -or $true } | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $installer) {
+            throw 'Could not find built Hermes-Setup.exe after tauri build'
+          }
+          Copy-Item -Path $installer -Destination "$downloads\Hermes-Setup.exe" -Force
+          Write-Host "Staged installer: $downloads\Hermes-Setup.exe (from $installer)"
+
+      # ── Prepare an isolated HERMES_HOME and pre-clone the repo ──────
+      # This lets install.ps1 use the local checkout as its git origin,
+      # so the whole flow exercises the real installer without reaching GitHub.
+      - name: Pre-clone workspace into isolated HERMES_HOME
+        shell: pwsh
+        run: |
+          $installDir = "$env:HERMES_HOME\hermes-agent"
+          New-Item -ItemType Directory -Path "$installDir\.." -Force | Out-Null
+          git clone --no-hardlinks "${{ github.workspace }}" "$installDir"
+          # Make sure the clone has the pinned commit reachable.
+          Push-Location "$installDir"
+          git fetch origin ${{ github.sha }} 2>$null || git fetch --depth=1 origin ${{ github.sha }}
+          Pop-Location
+          Write-Host "Isolated install dir ready: $installDir"
+
+      # ── Install AutoHotkey v2 ───────────────────────────────────────
+      - name: Install AutoHotkey v2
+        shell: pwsh
+        run: |
+          Invoke-RestMethod -Uri https://www.autohotkey.com/download/ahk-v2.exe -OutFile "$env:RUNNER_TEMP\AutoHotkey64.exe"
+          Write-Host "AutoHotkey ready: $env:RUNNER_TEMP\AutoHotkey64.exe"
+
+      # ── Screen recording for coordinate discovery ───────────────────
+      - name: Start screen recording
+        shell: pwsh
+        run: |
+          Start-Process ffmpeg -ArgumentList "-y -f gdigrab -framerate 15 -i desktop -vcodec libx264 -preset ultrafast recording.mp4" `
+            -RedirectStandardOutput ffmpeg.log -RedirectStandardError ffmpeg.err -PassThru |
+            ForEach-Object { $_.Id } | Out-File ffmpeg.pid
+
+      # ── Run the headed installer + AHK helper ───────────────────────
+      # For the first run we deliberately do NOT click the "Install Hermes"
+      # button.  AHK waits, captures the window, and exits.  A maintainer
+      # reviews the screenshots/recording, supplies the button coordinates,
+      # and we then update the AHK script to click them.
+      - name: Launch Hermes-Setup.exe and capture welcome screen
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $downloads = [Environment]::GetFolderPath('UserProfile') + '\Downloads'
+          $installer = "$downloads\Hermes-Setup.exe"
+
+          # Run the AHK helper first so it can detect the window.
+          $ahk = @'
+          #Requires AutoHotkey v2.0
+          #SingleInstance Force
+
+          ; Wait for the Hermes installer window to appear.
+          winTitle := "Hermes"
+          if not WinWait(winTitle,, 30)
+          {
+              FileAppend("ERROR: Hermes installer window did not appear within 30s`n", "ahk.log")
+              ExitApp(1)
+          }
+
+          WinGetPos(&x, &y, &w, &h, winTitle)
+          FileAppend(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h), "ahk.log")
+
+          ; TODO: replace with real coords after first CI run.
+          ; clickX := x + w // 2
+          ; clickY := y + h // 2 + 120
+          ; Click(clickX, clickY)
+          ; FileAppend(Format("Clicked at x={1} y={2}`n", clickX, clickY), "ahk.log")
+
+          ; Take a screenshot and exit.  Maintainer reviews this and sends coords.
+          Sleep(1000)
+          Send("{PrintScreen}")
+          FileAppend("Captured screenshot, exiting`n", "ahk.log")
+          ExitApp(0)
+          '@
+          $ahk | Out-File -Encoding utf8 "capture-button.ahk"
+
+          $ahkProc = Start-Process -FilePath "$env:RUNNER_TEMP\AutoHotkey64.exe" `
+            -ArgumentList '"capture-button.ahk"' -PassThru -NoNewWindow `
+            -RedirectStandardOutput ahk-stdout.log -RedirectStandardError ahk-stderr.log
+
+          # Launch the real installer (headed).
+          $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow
+          $proc.Id | Out-File installer.pid
+
+          # Wait for AHK helper to finish (30s window wait + 1s sleep).
+          $ahkProc | Wait-Process -Timeout 45 -ErrorAction SilentlyContinue
+          if (-not $ahkProc.HasExited) {
+            Write-Host "AHK helper is still running; stopping it"
+            Stop-Process -Id $ahkProc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+          # Leave the installer running briefly for the recording, then stop it.
+          Start-Sleep -Seconds 5
+          if ($proc -and -not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      # ── Run Playwright against the installed binary ─────────────────
+      # (placeholder: will be enabled once installer completes successfully.)
+      - name: Launch installed app and run e2e
+        if: false
+        working-directory: apps/desktop
+        run: npx playwright test e2e/ --reporter=list
+        env:
+          # Point the e2e spec at the desktop binary that the installer built.
+          HERMES_E2E_INSTALL_ROOT: ${{ env.HERMES_HOME }}\hermes-agent
+
+      # ── Teardown & artifacts ────────────────────────────────────────
+      - name: Stop screen recording
+        if: always()
+        shell: pwsh
+        run: |
+          $pid = Get-Content ffmpeg.pid -ErrorAction SilentlyContinue
+          if ($pid) {
+            Stop-Process -Id $pid -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+          }
+
+      - name: Upload screen recording
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screen-recording
+          path: recording.mp4
+          if-no-files-found: ignore
+
+      - name: Upload AHK logs and script
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ahk-discovery
+          path: |
+            ahk.log
+            ahk-stdout.log
+            ahk-stderr.log
+            capture-button.ahk
+          if-no-files-found: ignore
