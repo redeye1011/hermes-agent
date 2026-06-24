@@ -87,7 +87,6 @@ const state = (overrides: Partial<SubscriptionStateResponse> = {}): Subscription
 const ctx = {
   openManageLink: vi.fn(() => Promise.resolve(true)),
   refreshState: vi.fn(() => Promise.resolve(null)),
-  requestRemoteSpending: vi.fn(() => Promise.resolve(true)),
   sys: vi.fn()
 }
 
@@ -95,7 +94,6 @@ const overlay = (s: SubscriptionStateResponse, screen: SubscriptionOverlayState[
   ctx,
   screen,
   state: s,
-  resumeScreen: null,
   pendingTargetTierId: null
 })
 

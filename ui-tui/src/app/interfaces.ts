@@ -92,7 +92,13 @@ export interface GatewayProviderProps {
 // the SAME RPCs as the old slash flows (billing.charge / charge_status /
 // auto_reload / step_up).  Backend is unchanged & shared with the CLI.
 
-export type BillingScreen = 'autoreload' | 'buy' | 'confirm' | 'limit' | 'overview'
+export type BillingScreen = 'autoreload' | 'buy' | 'confirm' | 'limit' | 'overview' | 'stepup'
+
+/** Outcome of a charge attempt — lets the overlay route without tearing down. */
+export type BillingChargeOutcome =
+  | 'submitted'          // 202 accepted; settlement is reported via transcript lines
+  | 'needs_remote_spending'  // insufficient_scope → route to the stepup screen
+  | 'error'              // any other failure (already surfaced via sys)
 
 /**
  * The functions the overlay needs to talk to the gateway and emit
@@ -104,8 +110,19 @@ export type BillingScreen = 'autoreload' | 'buy' | 'confirm' | 'limit' | 'overvi
 export interface BillingOverlayCtx {
   /** Run `billing.auto_reload` (enabled/threshold/top_up) → resolve ok/false. */
   applyAutoReload: (enabled: boolean, threshold?: number, topUp?: number) => Promise<boolean>
-  /** Submit `billing.charge` for `amount` and poll to settlement (non-blocking). */
-  charge: (amount: string) => void
+  /**
+   * Submit `billing.charge` for `amount` and poll to settlement. Resolves a
+   * discriminated outcome so the overlay can route to the resumable step-up on
+   * `needs_remote_spending` instead of tearing down. Settlement/most errors are
+   * still reported via transcript lines (the poll is non-blocking).
+   */
+  charge: (amount: string) => Promise<BillingChargeOutcome>
+  /**
+   * Run the `billing.step_up` device flow (grant Remote Spending). Resolves
+   * `true` when the grant lands. The browser opens via the gateway's
+   * out-of-band `billing.step_up.verification` event — the overlay just awaits.
+   */
+  requestRemoteSpending: () => Promise<boolean>
   /** Open the portal in the browser + echo a transcript line. */
   openPortal: (url: string) => void
   /** Emit a transcript system line. */
@@ -131,17 +148,14 @@ export interface BillingOverlayState {
 
 export type SubscriptionScreen =
   | 'overview'      // shows plan + usage bar + tier list (states a–e collapse into this)
-  | 'confirm'       // y/n confirm before opening the Stripe URL
-  | 'stepup'        // Phase 4: "Allow Remote Spending" (resumable)
-  | 'handoff'       // transient: "Opening Stripe in your browser…"
+  | 'confirm'       // y/n confirm before opening the manage-subscription URL
+  | 'handoff'       // transient: "Opening your subscription page in your browser…"
 
 export interface SubscriptionOverlayCtx {
   /** Build {portal}/manage-subscription?org_id=… locally and open it. Resolves ok/false. */
   openManageLink: () => Promise<boolean>
-  /** Re-fetch subscription.state (used by Phase-4 resume). */
+  /** Re-fetch subscription.state. */
   refreshState: () => Promise<SubscriptionStateResponse | null>
-  /** Run billing.step_up (Remote Spending). Resolves granted. */
-  requestRemoteSpending: () => Promise<boolean>
   /** Emit a transcript system line. */
   sys: (text: string) => void
 }
@@ -150,9 +164,7 @@ export interface SubscriptionOverlayState {
   ctx: SubscriptionOverlayCtx
   screen: SubscriptionScreen
   state: SubscriptionStateResponse
-  /** Phase 4 resume bookkeeping: the screen to return to after step-up. */
-  resumeScreen?: SubscriptionScreen | null
-  /** Phase 4: the pending tier the user confirmed, replayed post-grant. */
+  /** The tier the user selected on the overview, summarized on the confirm screen. */
   pendingTargetTierId?: string | null
 }
 

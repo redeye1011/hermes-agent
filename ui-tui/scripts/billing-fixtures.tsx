@@ -83,7 +83,6 @@ const cur = (o: Record<string, unknown> = {}) => ({
 const subCtx: SubscriptionOverlayState['ctx'] = {
   openManageLink: () => Promise.resolve(true),
   refreshState: () => Promise.resolve(null),
-  requestRemoteSpending: () => Promise.resolve(true),
   sys: () => {}
 }
 
@@ -91,7 +90,6 @@ const sub = (s: SubscriptionStateResponse, screen: SubscriptionScreen = 'overvie
   ctx: subCtx,
   screen,
   state: s,
-  resumeScreen: null,
   pendingTargetTierId
 })
 
@@ -126,15 +124,16 @@ const billState = (o: Partial<BillingStateResponse> = {}): BillingStateResponse 
 
 const billCtx = {
   applyAutoReload: () => Promise.resolve(true),
-  charge: () => {},
+  charge: () => Promise.resolve('submitted' as const),
   openPortal: () => {},
+  requestRemoteSpending: () => Promise.resolve(true),
   sys: () => {},
   validate: (raw: string) => ({ amount: raw })
 }
 
 const bill = (s: BillingStateResponse, screen: BillingOverlayState['screen'] = 'overview'): BillingOverlayState => ({
   ctx: billCtx,
-  pendingCharge: screen === 'confirm' ? { amount: '25' } : null,
+  pendingCharge: screen === 'confirm' || screen === 'stepup' ? { amount: '100' } : null,
   screen,
   state: s
 })
@@ -212,6 +211,10 @@ const FIXTURES: Record<string, Fixture> = {
   'topup-buy': {
     desc: '/topup buy screen — presets',
     node: billEl(billState(), 'buy')
+  },
+  'topup-stepup': {
+    desc: '/topup step-up — "Allow Remote Spending" (resumable, holds $100 buy)',
+    node: billEl(billState(), 'stepup')
   }
 }
 

@@ -1,7 +1,4 @@
-import type {
-  BillingMutationResponse,
-  SubscriptionStateResponse
-} from '../../../gatewayTypes.js'
+import type { SubscriptionStateResponse } from '../../../gatewayTypes.js'
 import { openExternalUrl } from '../../../lib/openExternalUrl.js'
 import type { SubscriptionOverlayCtx } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
@@ -72,11 +69,6 @@ const buildSubscriptionCtx = (
       .rpc<SubscriptionStateResponse>('subscription.state', {})
       .then(r => r ?? null)
       .catch(() => null),
-  requestRemoteSpending: () =>
-    ctx.gateway
-      .rpc<BillingMutationResponse>('billing.step_up', { session_id: ctx.sid ?? undefined })
-      .then(r => !!(r && r.ok && r.granted))
-      .catch(() => false),
   sys
 })
 
@@ -104,7 +96,6 @@ export const subscriptionCommands: SlashCommand[] = [
               subscription: {
                 ctx: buildSubscriptionCtx(ctx, sys, s),
                 pendingTargetTierId: null,
-                resumeScreen: null,
                 screen: 'overview',
                 state: s
               }

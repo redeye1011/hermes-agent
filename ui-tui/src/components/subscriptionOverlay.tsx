@@ -19,8 +19,10 @@ interface SubscriptionOverlayProps {
 /**
  * The /subscription modal — deep-link only, NEVER charges in-terminal.
  * Mirrors billingOverlay.tsx's structure: a pure-render state machine
- * (overview → confirm → handoff, plus stepup for Phase 4) where all RPCs
- * live in subscription.ts and are reached through `overlay.ctx`.
+ * (overview → confirm → handoff) where all RPCs live in subscription.ts and
+ * are reached through `overlay.ctx`. No step-up here: changing a plan is a
+ * browser deep-link, which needs no billing scope (the scope gate is on
+ * /topup's charge, where the resumable step-up lives).
  */
 export function SubscriptionOverlay({ onClose, onPatch, overlay, t }: SubscriptionOverlayProps) {
   const { ctx, screen, state: s } = overlay
@@ -49,7 +51,6 @@ export function SubscriptionOverlay({ onClose, onPatch, overlay, t }: Subscripti
         />
       )}
       {screen === 'handoff' && <HandoffScreen onClose={onClose} t={t} />}
-      {/* stepup screen is built in Phase 4 (U9) */}
     </Box>
   )
 }
@@ -297,9 +298,8 @@ function ConfirmScreen({ ctx, onBack, onClose, onPatch, overlay, s, t }: Confirm
 
     void ctx.openManageLink().then(ok => {
       if (!ok) {
-        // If openManageLink surfaces insufficient_scope, the ctx closure in
-        // subscription.ts handles the stepup transition (Phase 4 wiring).
-        // For now, return to overview on any failure.
+        // openManageLink only fails if the portal URL can't be built or the
+        // browser won't open — return to overview (it sys()'d the reason).
         onPatch({ screen: 'overview' })
       }
     })
