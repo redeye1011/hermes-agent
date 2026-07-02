@@ -310,6 +310,12 @@ function phoneTargetFromSpaceId(spaceId) {
   return dmGuid ? dmGuid[1] : null;
 }
 
+function voiceUploadName(rawName) {
+  const original = typeof rawName === "string" && rawName.trim() ? rawName.trim() : "voice";
+  const withoutExt = original.replace(/\.[^./\\]+$/, "");
+  return `${withoutExt || "voice"}.m4a`;
+}
+
 function rememberInboundSpace(space, message) {
   const msgSpace = message?.space || {};
   const ids = [space?.id, msgSpace.id];
@@ -745,9 +751,14 @@ const server = http.createServer(async (req, res) => {
 
       // spectrum-ts infers name + MIME from the file extension; pass
       // overrides only when Hermes supplied them so a known-good
-      // inference isn't clobbered with an empty string.
+      // inference isn't clobbered with an empty string. For voice notes,
+      // Spectrum/iMessage transcodes non-m4a input internally but uploads
+      // using content.name verbatim; keeping a .mp3 name on m4a bytes creates
+      // 0-second/unplayable iMessage audio bubbles. Force the upload filename
+      // to .m4a while preserving the original MIME hint (for example
+      // audio/mpeg) so Spectrum still performs the transcode.
       const opts = {};
-      if (name) opts.name = name;
+      if (name) opts.name = kind === "voice" ? voiceUploadName(name) : name;
       if (mimeType) opts.mimeType = mimeType;
       const builder =
         kind === "voice"

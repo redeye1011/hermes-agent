@@ -12320,7 +12320,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
+        voice_key = self._voice_key(event.source.platform, chat_id)
+        voice_mode = self._voice_mode.get(voice_key, "off")
+        # Keep command-persisted state authoritative even if this runner's
+        # in-memory dict is stale after a sidecar/gateway reconnect.  This is
+        # especially important for plugin platforms such as Photon where /voice
+        # commands and normal replies can land across restart boundaries.
+        if voice_mode == "off":
+            try:
+                persisted_modes = self._load_voice_modes()
+            except Exception:
+                persisted_modes = {}
+            persisted_mode = persisted_modes.get(voice_key)
+            if persisted_mode in {"voice_only", "all"}:
+                self._voice_mode[voice_key] = persisted_mode
+                voice_mode = persisted_mode
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         should = (
@@ -12330,14 +12344,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not should:
             return False
 
-        # Dedup: agent already called TTS tool
+        # Dedup: agent already called TTS in *this turn*.
+        # Do not scan the whole transcript: a historical text_to_speech call in
+        # the same long-lived chat would permanently suppress /voice tts.  Walk
+        # backward and only inspect assistant tool calls after the latest user
+        # message; if the slice has no user marker (unit-test/minimal callers),
+        # keep the old conservative all-message behavior.
+        recent_messages = []
+        saw_user_boundary = False
+        for msg in reversed(agent_messages or []):
+            if msg.get("role") == "user":
+                saw_user_boundary = True
+                break
+            recent_messages.append(msg)
+        dedup_messages = list(reversed(recent_messages)) if saw_user_boundary else (agent_messages or [])
         has_agent_tts = any(
             msg.get("role") == "assistant"
             and any(
-                tc.get("function", {}).get("name") == "text_to_speech"
+                tc.get("function", {}).get("name") in {"text_to_speech", "text_to_speech_tool"}
                 for tc in (msg.get("tool_calls") or [])
             )
-            for msg in agent_messages
+            for msg in dedup_messages
         )
         if has_agent_tts:
             return False
@@ -12347,7 +12374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When streaming already delivered the text (already_sent=True),
         # the base adapter will receive None and can't run auto-TTS,
         # so the runner must take over.
-        if is_voice_input and not already_sent:
+        if is_voice_input and not already_sent and event.source.platform.value != "photon":
             return False
 
         return True
@@ -12418,7 +12445,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                send_result = await adapter.send_voice(**send_kwargs)
+                if not getattr(send_result, "success", False):
+                    logger.warning(
+                        "Auto voice reply send failed on %s: %s",
+                        event.source.platform.value,
+                        getattr(send_result, "error", None) or "unknown error",
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:

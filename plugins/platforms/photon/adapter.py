@@ -849,6 +849,14 @@ class PhotonAdapter(BasePlatformAdapter):
         env["PHOTON_SIDECAR_PORT"] = str(self._sidecar_port)
         env["PHOTON_SIDECAR_BIND"] = self._sidecar_bind
         env["PHOTON_SIDECAR_TOKEN"] = self._sidecar_token
+        # spectrum-ts falls back to spawning a plain `ffmpeg` binary when its
+        # optional `ffmpeg-static` import is not visible from a nested package.
+        # The sidecar vendors ffmpeg-static, so expose that binary on PATH too;
+        # otherwise Photon voice uploads can become 0-second/unplayable iMessage
+        # bubbles even though TTS generation itself succeeded.
+        static_ffmpeg_dir = _SIDECAR_DIR / "node_modules" / "ffmpeg-static"
+        if (static_ffmpeg_dir / "ffmpeg").exists():
+            env["PATH"] = f"{static_ffmpeg_dir}{os.pathsep}{env.get('PATH', '')}"
         # The sidecar exits when its stdin (the pipe below) hits EOF, so a
         # gateway death of ANY kind — including SIGKILL, where disconnect()
         # never runs — can't leave it orphaned on the port.
@@ -1433,8 +1441,13 @@ class PhotonAdapter(BasePlatformAdapter):
             "path": safe_path,
             "kind": "voice" if kind == "voice" else "attachment",
         }
-        if name:
-            body["name"] = name
+        # Spectrum/iMessage uploads voice bytes using content.name verbatim.
+        # When Hermes sends MP3 TTS as a voice note, the Node sidecar transcodes
+        # the bytes to m4a/aac and rewrites supplied voice names to .m4a.  Always
+        # provide a voice filename so auto-TTS paths (which don't pass `name`)
+        # don't inherit a .mp3 basename and render as 0-second/unplayable bubbles.
+        if name or kind == "voice":
+            body["name"] = name or os.path.basename(safe_path) or "voice"
         if mime_type:
             body["mimeType"] = mime_type
         if caption:

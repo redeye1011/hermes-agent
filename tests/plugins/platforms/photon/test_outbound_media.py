@@ -92,8 +92,28 @@ async def test_send_voice_marks_kind_voice(
 
     assert result.success is True
     path, body = calls[0]
-    assert path == "/send-attachment"
     assert body["kind"] == "voice"
+    assert body["name"] == "note.m4a"
+
+
+@pytest.mark.asyncio
+async def test_send_voice_supplies_basename_for_mp3_auto_tts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Photon voice sends must include a name so sidecar rewrites .mp3 to .m4a."""
+    _patch_safe_path(monkeypatch)
+    audio = tmp_path / "tts_reply_abc123.mp3"
+    audio.write_bytes(b"fake-mp3")
+    adapter = _make_adapter(monkeypatch)
+    calls = _capture_sidecar(adapter)
+
+    result = await adapter.send_voice("any;-;+1", str(audio))
+
+    assert result.success is True
+    _, body = calls[0]
+    assert body["kind"] == "voice"
+    assert body["name"] == "tts_reply_abc123.mp3"
+    assert body["mimeType"] == "audio/mpeg"
 
 
 @pytest.mark.asyncio

@@ -287,15 +287,16 @@ class TestAutoVoiceReply:
         return _make_runner(tmp_path)
 
     def _call(self, runner, voice_mode, message_type, agent_messages=None,
-              response="Hello!", in_voice_channel=False):
+              response="Hello!", in_voice_channel=False, platform_value="telegram"):
         """Call real _should_send_voice_reply on a GatewayRunner instance."""
         chat_id = "123"
         if voice_mode != "off":
-            runner._voice_mode["telegram:" + chat_id] = voice_mode
+            runner._voice_mode[f"{platform_value}:" + chat_id] = voice_mode
         else:
-            runner._voice_mode.pop("telegram:" + chat_id, None)
+            runner._voice_mode.pop(f"{platform_value}:" + chat_id, None)
 
         event = _make_event(message_type=message_type)
+        event.source.platform.value = platform_value
 
         if in_voice_channel:
             mock_adapter = MagicMock()
@@ -343,6 +344,34 @@ class TestAutoVoiceReply:
         """all + voice input: base auto-TTS handles it, runner skips."""
         assert self._call(runner, "all", MessageType.VOICE) is False
 
+    def test_photon_voice_input_runner_fires(self, runner):
+        """Photon voice replies use the runner path so /voice on works reliably."""
+        assert self._call(
+            runner,
+            "voice_only",
+            MessageType.VOICE,
+            platform_value="photon",
+        ) is True
+
+    def test_photon_text_input_all_mode_runner_fires(self, runner):
+        """Photon /voice tts must send voice for normal text-triggered replies."""
+        assert self._call(
+            runner,
+            "all",
+            MessageType.TEXT,
+            platform_value="photon",
+        ) is True
+
+    def test_persisted_voice_mode_is_reloaded_when_memory_stale(self, runner):
+        """Persisted /voice tts state stays authoritative after reconnect churn."""
+        runner._VOICE_MODE_PATH.write_text(json.dumps({"photon:123": "all"}))
+        assert self._call(
+            runner,
+            "off",
+            MessageType.TEXT,
+            platform_value="photon",
+        ) is True
+
     # -- Text input: only runner handles -----------------------------------
 
     def test_text_input_all_mode_runner_fires(self, runner):
@@ -389,6 +418,31 @@ class TestAutoVoiceReply:
                 "function": {"name": "text_to_speech", "arguments": "{}"},
             }],
         }]
+        assert self._call(runner, "all", MessageType.TEXT, agent_messages=messages) is False
+
+    def test_historical_tts_before_latest_user_does_not_suppress(self, runner):
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "type": "function",
+                    "function": {"name": "text_to_speech", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "content": "old tts result"},
+            {"role": "assistant", "content": "old reply"},
+            {"role": "user", "content": "new request"},
+            {"role": "assistant", "content": "new reply"},
+        ]
+        assert self._call(runner, "all", MessageType.TEXT, agent_messages=messages) is True
+
+    def test_current_turn_tts_after_latest_user_still_suppresses(self, runner):
+        messages = [
+            {"role": "assistant", "tool_calls": [{"function": {"name": "text_to_speech"}}]},
+            {"role": "user", "content": "new request"},
+            {"role": "assistant", "tool_calls": [{"function": {"name": "text_to_speech"}}]},
+        ]
         assert self._call(runner, "all", MessageType.TEXT, agent_messages=messages) is False
 
     def test_no_dedup_for_other_tools(self, runner):
