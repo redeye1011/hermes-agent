@@ -254,6 +254,45 @@ async def test_dispatch_voice_downloads_audio(
 
 
 @pytest.mark.asyncio
+async def test_imessage_audio_message_caf_attachment_routes_as_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iMessage voice notes can arrive as attachment/Audio Message.caf.
+
+    They must be treated as VOICE so `/voice on` runs STT and then returns an
+    auto-TTS voice reply, instead of showing the CAF as a generic document.
+    """
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    raw = b"caff" + b"\x00" * 32
+    event = _attachment_event(
+        {
+            "name": "Audio Message.caf",
+            "mimeType": "",
+            "size": len(raw),
+            "data": base64.b64encode(raw).decode("ascii"),
+            "encoding": "base64",
+        }
+    )
+    await adapter._dispatch_inbound(event)
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert ev.message_type == MessageType.VOICE
+    assert ev.media_types == ["audio/x-caf"]
+    assert len(ev.media_urls) == 1
+    cached = Path(ev.media_urls[0])
+    try:
+        assert cached.is_file()
+        assert cached.suffix == ".caf"
+        assert cached.read_bytes() == raw
+        assert ev.text == "(voice)"
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_dispatch_voice_without_bytes_surfaces_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

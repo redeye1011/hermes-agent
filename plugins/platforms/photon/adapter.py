@@ -591,9 +591,14 @@ class PhotonAdapter(BasePlatformAdapter):
         def _normalize_binary_payload(
             payload: Dict[str, Any]
         ) -> tuple[str, MessageType, List[str], List[str]]:
-            is_voice = payload.get("type") == "voice"
+            # Photon/iMessage currently surfaces Apple voice notes as ordinary
+            # attachments named "Audio Message.caf" (often with no useful MIME),
+            # not as Spectrum `type: "voice"`. Treat that exact iMessage shape
+            # as voice so `/voice on` runs STT + TTS instead of handing a CAF
+            # file to the agent as a generic document.
+            is_voice = payload.get("type") == "voice" or _is_imessage_voice_attachment(payload)
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
-            mime = payload.get("mimeType") or ""
+            mime = payload.get("mimeType") or ("audio/x-caf" if is_voice and str(name).lower().endswith(".caf") else "")
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
@@ -1503,10 +1508,28 @@ _AUDIO_EXT_BY_MIME = {
     "audio/mpeg": ".mp3",
     "audio/ogg": ".ogg",
     "audio/wav": ".wav",
-    "audio/x-caf": ".mp3",
+    "audio/x-caf": ".caf",
     "audio/mp4": ".m4a",
     "audio/aac": ".m4a",
 }
+
+
+def _is_imessage_voice_attachment(content: Dict[str, Any]) -> bool:
+    """Return True for iMessage voice-note attachments reported as CAF files.
+
+    Spectrum/Photon may classify iMessage voice notes as ``type: attachment``
+    with name ``Audio Message.caf`` and a blank/octet-stream MIME. Those are
+    semantically voice messages: they should be transcribed and should satisfy
+    `/voice on` voice-to-voice mode. Ordinary audio files (mp3/m4a uploads) stay
+    MessageType.AUDIO so they are not automatically STT'd.
+    """
+    if content.get("type") != "attachment":
+        return False
+    name = str(content.get("name") or "").strip().lower()
+    mime = str(content.get("mimeType") or "").strip().lower()
+    if mime == "audio/x-caf":
+        return True
+    return name == "audio message.caf" or name.endswith("/audio message.caf")
 
 
 def _cache_inbound_attachment(

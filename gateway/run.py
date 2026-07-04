@@ -11580,10 +11580,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
-            # Auto voice reply: send TTS audio before the text response
+            # Auto voice reply: send TTS audio before the text response.  For
+            # queued/interrupt follow-ups, the actual user turn may be a voice
+            # event even when the outer delivery event was a prior text/status
+            # trigger, so _run_agent carries the voice event back explicitly.
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
-                await self._send_voice_reply(event, response)
+            _voice_reply_event = agent_result.get("_voice_reply_event") or event
+            if self._should_send_voice_reply(_voice_reply_event, response, agent_messages, already_sent=_already_sent):
+                await self._send_voice_reply(_voice_reply_event, response)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -12534,7 +12538,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # When streaming already delivered the text (already_sent=True),
         # the base adapter will receive None and can't run auto-TTS,
         # so the runner must take over.
-        if is_voice_input and not already_sent:
+        if is_voice_input and not already_sent and not getattr(event, "_force_runner_voice_reply", False):
             return False
 
         return True
@@ -19069,11 +19073,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_key or "?",
                         )
                         return result
-                    next_message = await self._prepare_inbound_message_text(
-                        event=pending_event,
-                        source=next_source,
-                        history=updated_history,
-                    )
+                    if pending is not None:
+                        # The drain block above may have already converted a
+                        # queued voice/audio event into an STT-enriched prompt.
+                        # Do not run the generic media/document preparation a
+                        # second time: it can re-add the cached CAF as a generic
+                        # document note and lose the fact that this follow-up was
+                        # voice input.
+                        next_message = pending
+                    else:
+                        next_message = await self._prepare_inbound_message_text(
+                            event=pending_event,
+                            source=next_source,
+                            history=updated_history,
+                        )
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
@@ -19120,6 +19133,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                 )
+                if (
+                    pending_event is not None
+                    and getattr(pending_event, "message_type", None) == MessageType.VOICE
+                    and isinstance(followup_result, dict)
+                ):
+                    # The outer delivery path decides /voice on from the
+                    # original event. If the actual user turn was a queued
+                    # voice follow-up, carry that event forward so auto-TTS
+                    # uses the voice input rather than the stale trigger event.
+                    setattr(pending_event, "_force_runner_voice_reply", True)
+                    followup_result["_voice_reply_event"] = pending_event
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

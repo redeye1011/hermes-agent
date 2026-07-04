@@ -749,6 +749,20 @@ const server = http.createServer(async (req, res) => {
       const opts = {};
       if (name) opts.name = name;
       if (mimeType) opts.mimeType = mimeType;
+
+      // iMessage voice bubbles must be uploaded as m4a/aac. Spectrum's
+      // voice() path transcodes non-m4a bytes via ffmpeg, but it preserves
+      // content.name as the upload filename. KIE/ElevenLabs returns MP3, so
+      // leaving the inferred basename as `tts_reply_*.mp3` produces an iMessage
+      // audio-message bubble whose bytes are m4a but whose filename says mp3;
+      // some clients render that as unplayable/0-second audio. For voice sends,
+      // force the upload name to .m4a while preserving the original MIME hint so
+      // ensureM4a still knows when to transcode.
+      if (kind === "voice") {
+        const base = (name || "voice").replace(/\.[^/.]+$/, "") || "voice";
+        opts.name = `${base}.m4a`;
+      }
+
       const builder =
         kind === "voice"
           ? voice(path, Object.keys(opts).length ? opts : undefined)

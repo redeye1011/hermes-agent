@@ -343,6 +343,15 @@ class TestAutoVoiceReply:
         """all + voice input: base auto-TTS handles it, runner skips."""
         assert self._call(runner, "all", MessageType.VOICE) is False
 
+    def test_queued_voice_followup_forces_runner_voice_reply(self, runner):
+        """Queued voice follow-ups bypass base adapter auto-TTS, so runner handles them."""
+        chat_id = "123"
+        runner._voice_mode["telegram:" + chat_id] = "voice_only"
+        event = _make_event(message_type=MessageType.VOICE)
+        setattr(event, "_force_runner_voice_reply", True)
+
+        assert runner._should_send_voice_reply(event, "Hello!", []) is True
+
     # -- Text input: only runner handles -----------------------------------
 
     def test_text_input_all_mode_runner_fires(self, runner):

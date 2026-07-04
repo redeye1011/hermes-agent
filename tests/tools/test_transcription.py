@@ -106,6 +106,12 @@ class TestValidateAudioFile:
         from tools.transcription_tools import _validate_audio_file
         assert _validate_audio_file(str(f)) is None
 
+    def test_caf_file_is_supported_for_imessage_voice_notes(self, tmp_path):
+        f = tmp_path / "Audio Message.caf"
+        f.write_bytes(b"caff fake caf bytes")
+        from tools.transcription_tools import _validate_audio_file
+        assert _validate_audio_file(str(f)) is None
+
     def test_too_large(self, tmp_path):
         f = tmp_path / "big.ogg"
         f.write_bytes(b"x")
