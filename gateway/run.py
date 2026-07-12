@@ -1071,6 +1071,7 @@ def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    keep_latest_tts_only: bool = False,
 ) -> tuple[List[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
@@ -1111,6 +1112,8 @@ def _collect_auto_append_media_tags(
 
     media_tags: List[str] = []
     has_voice_directive = False
+    latest_tts_tags: List[str] = []
+    latest_tts_has_voice_directive = False
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
@@ -1138,14 +1141,65 @@ def _collect_auto_append_media_tags(
             continue
         if "MEDIA:" not in content:
             continue
+        found_tags: List[str] = []
         for match in _TOOL_MEDIA_RE.finditer(content):
             path = match.group(1).strip().rstrip('",}')
             if path and path not in history_media_paths:
-                media_tags.append(f"MEDIA:{path}")
+                found_tags.append(f"MEDIA:{path}")
+        if keep_latest_tts_only and tool_name in {"text_to_speech", "text_to_speech_tool"}:
+            if found_tags:
+                latest_tts_tags = found_tags
+                latest_tts_has_voice_directive = "[[audio_as_voice]]" in content
+            continue
+        media_tags.extend(found_tags)
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
+    if keep_latest_tts_only and latest_tts_tags:
+        media_tags.append(latest_tts_tags[-1])
+        has_voice_directive = has_voice_directive or latest_tts_has_voice_directive
+
     return media_tags, has_voice_directive
+
+
+def _collect_auto_append_tts_text(
+    messages: List[Dict[str, Any]], history_offset: int = 0
+) -> str:
+    """Return the latest current-turn text supplied to the TTS tool."""
+    if history_offset and len(messages) >= history_offset:
+        new_messages = messages[history_offset:]
+    else:
+        new_messages = messages
+
+    latest_text = ""
+    for msg in new_messages:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            tool_name = str(fn.get("name") or call.get("name") or "")
+            if tool_name not in {"text_to_speech", "text_to_speech_tool"}:
+                continue
+            raw_args = fn.get("arguments") or call.get("arguments") or {}
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if isinstance(raw_args, dict):
+                text = raw_args.get("text")
+                if isinstance(text, str) and text.strip():
+                    latest_text = text.strip()
+    return latest_text
+
+
+def _ensure_photon_tts_text_reply(final_response: str, tts_text: str) -> str:
+    """Keep Photon text complete when the agent also requested TTS output."""
+    final_text = (final_response or "").strip()
+    spoken_text = (tts_text or "").strip()
+    if not spoken_text or spoken_text in final_text:
+        return final_text
+    return f"{final_text}\n\n{spoken_text}" if final_text else spoken_text
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
@@ -19090,11 +19144,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
+            # Photon voice replies have a one-attachment contract: use the
+            # latest TTS artifact and include its complete spoken text as a
+            # normal text message, never merely a tool-generated title.
+            _is_photon_delivery = (
+                getattr(source.platform, "value", source.platform) == "photon"
+            )
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),
                     history_media_paths=_history_media_paths,
+                    keep_latest_tts_only=_is_photon_delivery,
                 )
 
                 if media_tags:
@@ -19107,6 +19168,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+            if _is_photon_delivery:
+                final_response = _ensure_photon_tts_text_reply(
+                    final_response,
+                    _collect_auto_append_tts_text(
+                        result.get("messages", []), history_offset=len(agent_history)
+                    ),
+                )
             
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:
