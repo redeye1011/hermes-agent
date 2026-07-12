@@ -1194,7 +1194,9 @@ def _collect_auto_append_media_tags(
 
 
 def _collect_latest_successful_tts_media(
-    messages: List[Dict[str, Any]], history_offset: int = 0
+    messages: List[Dict[str, Any]],
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
 ) -> tuple[str, str]:
     """Return the latest TTS media tag together with the text that created it."""
     if history_offset and len(messages) >= history_offset:
@@ -1202,6 +1204,7 @@ def _collect_latest_successful_tts_media(
     else:
         new_messages = messages
 
+    history_media_paths = history_media_paths or set()
     tts_text_by_call_id: Dict[str, str] = {}
     for msg in new_messages:
         if msg.get("role") != "assistant":
@@ -1234,7 +1237,10 @@ def _collect_latest_successful_tts_media(
         content = str(msg.get("content") or "")
         for match in _TOOL_MEDIA_RE.finditer(content):
             path = match.group(1).strip().rstrip('\",}')
-            if Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS:
+            if (
+                Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS
+                and path not in history_media_paths
+            ):
                 latest_tag = f"MEDIA:{path}"
                 latest_text = tts_text_by_call_id[call_id]
     return latest_tag, latest_text
@@ -12502,6 +12508,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
+                        _photon_tts_followup = agent_result.get("_photon_tts_text_followup")
+                        if _photon_tts_followup:
+                            try:
+                                await _media_adapter.send(
+                                    source.chat_id,
+                                    _photon_tts_followup,
+                                    metadata=self._thread_metadata_for_source(
+                                        source, self._reply_anchor_for_event(event)
+                                    ),
+                                )
+                            except Exception as _followup_error:
+                                logger.warning(
+                                    "Photon streamed TTS text follow-up failed: %s",
+                                    _followup_error,
+                                )
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
@@ -19737,7 +19758,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _photon_tts_text = ""
             if _is_photon_delivery:
                 _photon_tts_tag, _photon_tts_text = _collect_latest_successful_tts_media(
-                    result.get("messages", []), history_offset=len(agent_history)
+                    result.get("messages", []),
+                    history_offset=len(agent_history),
+                    history_media_paths=_history_media_paths,
                 )
                 final_response = _normalize_photon_audio_media_tags(
                     final_response, _photon_tts_tag
@@ -19761,9 +19784,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             if _is_photon_delivery:
+                _before_photon_tts_text = final_response
                 final_response = _ensure_photon_tts_text_reply(
                     final_response, _photon_tts_text
                 )
+                if final_response != _before_photon_tts_text:
+                    result["_photon_tts_text_followup"] = _photon_tts_text
             
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:
