@@ -188,7 +188,7 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     assert "formatChildId(text2 ? i + 1 : i, messageGuidStr)" in patched
     # The text is captured in both mappers before the attachment branches run.
     assert "const text2 = message.content.text;" in patched
-    assert "const text2 = event.message.content.text;" in patched
+    assert "const text2 = sourceMessage.content.text;" in patched
 
     # Re-running is a no-op (idempotent self-heal on every sidecar start).
     again = subprocess.run(

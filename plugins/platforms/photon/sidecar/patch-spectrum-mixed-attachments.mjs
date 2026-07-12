@@ -18,7 +18,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const MIXED_MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const HYDRATION_MARKER = "Hermes patch: Hydrate placeholder-only iMessage attachments";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -103,6 +104,15 @@ function patchInbound(source) {
   return source;
 }
 
+function patchRemotePlaceholderHydration(source) {
+  return replaceOnce(
+    source,
+    `\tconst base = buildMessageBase(event.message, event.chatGuid, event.occurredAt, phone);\n\tconst messageGuidStr = event.message.guid;\n\tconst attachments = messageAttachments(event.message);\n\tconst text2 = event.message.content.text;\n\tif (attachments.length === 1) {`,
+    `\tlet sourceMessage = event.message;\n\tconst isPlaceholderOnly = (message) => {\n\t\tconst text = message.content.text;\n\t\treturn typeof text === "string" && text.includes("￼") && text.split("￼").join("").trim() === "" && messageAttachments(message).length === 0;\n\t};\n\tif (isPlaceholderOnly(sourceMessage)) {\n\t\t// ponytail: bounded re-fetch closes Photon’s attachment-join race.\n\t\tfor (let attempt = 0; attempt < ATTACHMENT_JOIN_RETRY_LIMIT; attempt += 1) {\n\t\t\tawait setTimeout$1(ATTACHMENT_JOIN_RETRY_DELAY_MS);\n\t\t\ttry {\n\t\t\t\tconst refreshed = await client.messages.get(toMessageGuid(sourceMessage.guid));\n\t\t\t\tif (refreshed) sourceMessage = refreshed;\n\t\t\t} catch {}\n\t\t\tif (!isPlaceholderOnly(sourceMessage)) break;\n\t\t}\n\t\tif (isPlaceholderOnly(sourceMessage)) return [];\n\t}\n\tconst base = buildMessageBase(sourceMessage, event.chatGuid, event.occurredAt, phone);\n\tconst messageGuidStr = sourceMessage.guid;\n\tconst attachments = messageAttachments(sourceMessage);\n\tconst text2 = sourceMessage.content.text;\n\tif (attachments.length === 1) {`,
+    "remote placeholder hydration"
+  );
+}
+
 // Shift attachment part indices by one when a text child occupies slot 0. The
 // push line is byte-identical in both mappers, so patch both occurrences.
 function patchChildIndices(source) {
@@ -132,7 +142,7 @@ export function patchSpectrumTs(root = scriptDir()) {
 
   for (const file of files) {
     const raw = fs.readFileSync(file, "utf8");
-    if (raw.includes(MARKER)) {
+    if (raw.includes(HYDRATION_MARKER)) {
       return { patched: false, file, reason: "already patched" };
     }
     // Normalize to LF for matching so the patch works regardless of the
@@ -149,10 +159,14 @@ export function patchSpectrumTs(root = scriptDir()) {
       continue;
     }
     let patched = original;
-    patched = patchRebuild(patched);
-    patched = patchInbound(patched);
-    patched = patchChildIndices(patched);
-    patched = `// ${MARKER}\n${patched}`;
+    if (!patched.includes(MIXED_MARKER)) {
+      patched = patchRebuild(patched);
+      patched = patchInbound(patched);
+      patched = patchChildIndices(patched);
+      patched = `// ${MIXED_MARKER}\n${patched}`;
+    }
+    patched = patchRemotePlaceholderHydration(patched);
+    patched = `// ${HYDRATION_MARKER}\n${patched}`;
     if (usedCRLF) {
       patched = patched.split("\n").join(CRLF);
     }
