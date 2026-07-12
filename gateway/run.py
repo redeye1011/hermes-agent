@@ -1025,6 +1025,9 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech_tool",
     "image_generate",
 }
+_TTS_MEDIA_TOOL_NAMES = frozenset({"text_to_speech", "text_to_speech_tool"})
+_PHOTON_AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"})
+
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
@@ -1190,23 +1193,24 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 
-def _collect_auto_append_tts_text(
+def _collect_latest_successful_tts_media(
     messages: List[Dict[str, Any]], history_offset: int = 0
-) -> str:
-    """Return the latest current-turn text supplied to the TTS tool."""
+) -> tuple[str, str]:
+    """Return the latest TTS media tag together with the text that created it."""
     if history_offset and len(messages) >= history_offset:
         new_messages = messages[history_offset:]
     else:
         new_messages = messages
 
-    latest_text = ""
+    tts_text_by_call_id: Dict[str, str] = {}
     for msg in new_messages:
         if msg.get("role") != "assistant":
             continue
         for call in msg.get("tool_calls") or []:
+            call_id = str(call.get("id") or call.get("call_id") or "")
             fn = call.get("function") or {}
             tool_name = str(fn.get("name") or call.get("name") or "")
-            if tool_name not in {"text_to_speech", "text_to_speech_tool"}:
+            if not call_id or tool_name not in _TTS_MEDIA_TOOL_NAMES:
                 continue
             raw_args = fn.get("arguments") or call.get("arguments") or {}
             if isinstance(raw_args, str):
@@ -1217,8 +1221,56 @@ def _collect_auto_append_tts_text(
             if isinstance(raw_args, dict):
                 text = raw_args.get("text")
                 if isinstance(text, str) and text.strip():
-                    latest_text = text.strip()
-    return latest_text
+                    tts_text_by_call_id[call_id] = text.strip()
+
+    latest_tag = ""
+    latest_text = ""
+    for msg in new_messages:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        if call_id not in tts_text_by_call_id:
+            continue
+        content = str(msg.get("content") or "")
+        for match in _TOOL_MEDIA_RE.finditer(content):
+            path = match.group(1).strip().rstrip('\",}')
+            if Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS:
+                latest_tag = f"MEDIA:{path}"
+                latest_text = tts_text_by_call_id[call_id]
+    return latest_tag, latest_text
+
+
+def _normalize_photon_audio_media_tags(response: str, preferred_audio_tag: str = "") -> str:
+    """Cap Photon audio tags in a reply to one selected native voice artifact."""
+    matches = list(_TOOL_MEDIA_RE.finditer(response or ""))
+    audio_matches = [
+        match for match in matches
+        if Path(match.group(1).strip().rstrip('\",}')).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS
+    ]
+    selected_tag = preferred_audio_tag
+    if not selected_tag and audio_matches:
+        selected_path = audio_matches[-1].group(1).strip().rstrip('\",}')
+        selected_tag = "MEDIA:" + selected_path
+    if not audio_matches:
+        if selected_tag and selected_tag not in (response or ""):
+            return f"{(response or '').rstrip()}\n{selected_tag}".lstrip()
+        return response
+
+    parts: List[str] = []
+    cursor = 0
+    emitted_audio = False
+    for match in matches:
+        parts.append(response[cursor:match.start()])
+        path = match.group(1).strip().rstrip('\",}')
+        if Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS:
+            if not emitted_audio:
+                parts.append(selected_tag)
+                emitted_audio = True
+        else:
+            parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(response[cursor:])
+    return "".join(parts).strip()
 
 
 def _ensure_photon_tts_text_reply(final_response: str, tts_text: str) -> str:
@@ -13453,7 +13505,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
-                    if ext in _VIDEO_EXTS:
+                    if should_send_media_as_audio(event.source.platform, ext):
+                        await adapter.send_voice(
+                            chat_id=event.source.chat_id,
+                            audio_path=file_path,
+                            metadata=_thread_meta,
+                        )
+                    elif ext in _VIDEO_EXTS:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
@@ -19333,6 +19391,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _is_photon_delivery = (
                 getattr(source.platform, "value", source.platform) == "photon"
             )
+            _photon_tts_tag = ""
+            _photon_tts_text = ""
+            if _is_photon_delivery:
+                _photon_tts_tag, _photon_tts_text = _collect_latest_successful_tts_media(
+                    result.get("messages", []), history_offset=len(agent_history)
+                )
+                final_response = _normalize_photon_audio_media_tags(
+                    final_response, _photon_tts_tag
+                )
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
@@ -19353,10 +19420,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             if _is_photon_delivery:
                 final_response = _ensure_photon_tts_text_reply(
-                    final_response,
-                    _collect_auto_append_tts_text(
-                        result.get("messages", []), history_offset=len(agent_history)
-                    ),
+                    final_response, _photon_tts_text
                 )
             
             # Auto-generate session title after first exchange (non-blocking)
