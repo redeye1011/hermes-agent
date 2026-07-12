@@ -88,6 +88,30 @@ async def test_photon_deduplicates_bare_and_media_tag_audio_before_delivery(
 
 
 @pytest.mark.asyncio
+async def test_photon_routes_a_bare_audio_file_through_native_voice_delivery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Photon must convert standalone MP3 artifacts instead of attaching raw MP3."""
+    audio = tmp_path / "standalone.mp3"
+    audio.write_bytes(b"audio")
+    adapter = DummyPhotonAdapter()
+    adapter._keep_typing = _hold_typing()
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=f"Listen here:\n{audio}"))
+    monkeypatch.setattr(
+        DummyPhotonAdapter,
+        "validate_media_delivery_path",
+        staticmethod(lambda path: path if Path(path).is_file() else None),
+    )
+
+    event = _event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert [item["content"] for item in adapter.sent] == ["Listen here:"]
+    assert adapter.voice_paths == [str(audio)]
+    assert adapter.document_paths == []
+
+
+@pytest.mark.asyncio
 async def test_photon_auto_tts_always_sends_the_full_text_reply(
     tmp_path: Path,
 ) -> None:
