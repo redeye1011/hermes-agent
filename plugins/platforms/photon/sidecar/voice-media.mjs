@@ -18,7 +18,7 @@ export async function prepareVoiceMedia({ path, name, mimeType, ffmpegPath = ffm
     return {
       path,
       name: m4aName(name, path),
-      mimeType: undefined,
+      mimeType: "audio/mp4",
       cleanup: async () => {},
     };
   }
@@ -40,7 +40,7 @@ export async function prepareVoiceMedia({ path, name, mimeType, ffmpegPath = ffm
   return {
     path: output,
     name: m4aName(name, path),
-    mimeType: undefined,
+    mimeType: "audio/mp4",
     cleanup: async () => rm(dir, { recursive: true, force: true }),
   };
 }
