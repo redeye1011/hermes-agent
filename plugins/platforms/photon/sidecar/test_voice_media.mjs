@@ -40,21 +40,21 @@ test("converts MP3 voice media to M4A and cleans up", async () => {
   }
 });
 
-test("keeps compatible M4A voice media unchanged", async () => {
+test("keeps compatible M4A voice media without stale metadata", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hermes-photon-voice-test-"));
   try {
     const input = join(dir, "reply.m4a");
     await writeFile(input, "m4a-bytes");
     const media = await prepareVoiceMedia({
       path: input,
-      name: "reply.m4a",
-      mimeType: "audio/mp4",
+      name: "reply.mp3",
+      mimeType: "audio/mpeg",
       ffmpegPath: join(dir, "must-not-run"),
     });
 
     assert.equal(media.path, input);
     assert.equal(media.name, "reply.m4a");
-    assert.equal(media.mimeType, "audio/mp4");
+    assert.equal(media.mimeType, undefined);
     await media.cleanup();
     assert.equal((await readFile(input)).toString(), "m4a-bytes");
   } finally {
