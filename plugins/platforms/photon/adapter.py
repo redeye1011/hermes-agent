@@ -674,9 +674,18 @@ class PhotonAdapter(BasePlatformAdapter):
         def _normalize_binary_payload(
             payload: Dict[str, Any]
         ) -> tuple[str, MessageType, List[str], List[str]]:
-            is_voice = payload.get("type") == "voice"
-            name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
+            name = payload.get("name") or "(unnamed)"
             mime = payload.get("mimeType") or ""
+            is_native_imessage_voice = (
+                payload.get("type") == "attachment"
+                and name.lower() == "audio message.caf"
+                and not mime.strip()
+            )
+            is_voice = payload.get("type") == "voice" or is_native_imessage_voice
+            if is_native_imessage_voice:
+                mime = "audio/x-caf"
+            if is_voice and name == "(unnamed)":
+                name = "voice"
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
