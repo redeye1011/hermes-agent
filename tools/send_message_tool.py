@@ -725,13 +725,30 @@ async def _send_via_adapter(
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                if not result.success:
+                    return {"error": f"Adapter send failed: {result.error}"}
+                if media_files:
+                    from gateway.platforms.base import should_send_media_as_audio
+
+                    for media_path, is_voice in media_files:
+                        ext = os.path.splitext(media_path)[1].lower()
+                        if not force_document and should_send_media_as_audio(
+                            platform, ext, is_voice=is_voice
+                        ):
+                            media_result = await adapter.send_voice(
+                                chat_id=chat_id, audio_path=media_path, metadata=metadata
+                            )
+                        else:
+                            media_result = await adapter.send_document(
+                                chat_id=chat_id, file_path=media_path, metadata=metadata
+                            )
+                        if not media_result.success:
+                            return {"error": f"Adapter media send failed: {media_result.error}"}
+                return {"success": True, "message_id": result.message_id}
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
     try:

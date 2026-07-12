@@ -234,6 +234,30 @@ caption
         )
 
 
+    def test_photon_compaction_does_not_replay_historical_tts_media(self):
+        """A shrunk message list must not resurrect an older Photon voice reply."""
+        from gateway.run import _collect_latest_successful_tts_media
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "old", "function": {
+                        "name": "text_to_speech",
+                        "arguments": '{"text": "Old reply."}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "MEDIA:/tmp/old.mp3"},
+        ]
+
+        assert _collect_latest_successful_tts_media(
+            messages,
+            history_offset=10,
+            history_media_paths={"/tmp/old.mp3"},
+        ) == ("", "")
+
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
