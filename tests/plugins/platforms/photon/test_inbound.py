@@ -375,6 +375,42 @@ async def test_on_inbound_line_dispatches_and_dedups(
 
 
 @pytest.mark.asyncio
+async def test_on_inbound_line_skips_placeholder_before_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A U+FFFC placeholder must not hide a later hydrated CAF event."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    raw = b"caff" + b"\x00" * 32
+
+    await adapter._on_inbound_line(json.dumps(_dm_event("\ufffc", msg_id="voice-race")))
+    await adapter._on_inbound_line(
+        json.dumps(
+            _attachment_event(
+                {
+                    "name": "Audio Message.caf",
+                    "mimeType": "",
+                    "size": len(raw),
+                    "data": base64.b64encode(raw).decode("ascii"),
+                    "encoding": "base64",
+                },
+                msg_id="voice-race",
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.message_type == MessageType.VOICE
+    cached = Path(event.media_urls[0])
+    try:
+        assert cached.suffix == ".caf"
+        assert cached.read_bytes() == raw
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_on_inbound_line_ignores_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
