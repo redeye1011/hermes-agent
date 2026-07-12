@@ -77,6 +77,10 @@ const asText = (text) => ({ type: "text", text });
 const asCustom = (message) => ({ type: "custom" });
 const asProviderGroup = (items) => ({ type: "group", items });
 const messageAttachments = (message) => message.content.attachments ?? [];
+const toMessageGuid = (value) => value;
+const ATTACHMENT_JOIN_RETRY_DELAY_MS = 0;
+const ATTACHMENT_JOIN_RETRY_LIMIT = 2;
+const setTimeout$1 = async () => {};
 const buildMessageBase = (message, chatGuidHint, timestamp, phone) => ({ direction: "inbound", sender: { id: "s" }, space: { id: "sp", type: "dm", phone }, timestamp });
 const buildAttachmentMessage = async (client, base, info, id, partIndex, parentId) => {
   const msg = { ...base, id, content: { type: "attachment", id: info.guid }, partIndex };
@@ -243,6 +247,18 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
         // Text only, no attachments -> plain text (unchanged).
         r = await rebuildFromAppleMessage(null, {{ guid: "G4", content: {{ text: "just text", attachments: [] }} }}, "+1");
         assert(r.content.type === "text" && r.content.text === "just text" && r.id === "G4", "text-only unchanged");
+
+        // A remote iMessage voice note can first arrive as Apple's U+FFFC
+        // placeholder. Re-fetching must hydrate its attachment before emission.
+        const placeholder = {{ guid: "G5", content: {{ text: "\uFFFC", attachments: [] }} }};
+        const hydrated = {{ guid: "G5", content: {{ text: "", attachments: [{{ guid: "A0" }}] }} }};
+        let refetches = 0;
+        arr = await toInboundMessages({{ messages: {{ get: async () => {{ refetches += 1; return hydrated; }} }} }}, new Map(), {{ message: placeholder }}, "+1");
+        assert(refetches === 1 && arr.length === 1 && arr[0].content.type === "attachment", "placeholder hydrates to attachment");
+
+        // A permanently incomplete placeholder is not an agent-visible text turn.
+        arr = await toInboundMessages({{ messages: {{ get: async () => placeholder }} }}, new Map(), {{ message: placeholder }}, "+1");
+        assert(arr.length === 0, "unhydrated placeholder suppressed");
         """
     )
     run = subprocess.run(
