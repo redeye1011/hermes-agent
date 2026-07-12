@@ -30,7 +30,7 @@ test("converts MP3 voice media to M4A and cleans up", async () => {
 
     assert.match(media.path, /\.m4a$/);
     assert.equal(media.name, "reply.m4a");
-    assert.equal(media.mimeType, undefined);
+    assert.equal(media.mimeType, "audio/mp4");
     assert.equal((await readFile(media.path)).toString(), "mp3-bytes");
 
     await media.cleanup();
@@ -54,7 +54,7 @@ test("keeps compatible M4A voice media without stale metadata", async () => {
 
     assert.equal(media.path, input);
     assert.equal(media.name, "reply.m4a");
-    assert.equal(media.mimeType, undefined);
+    assert.equal(media.mimeType, "audio/mp4");
     await media.cleanup();
     assert.equal((await readFile(input)).toString(), "m4a-bytes");
   } finally {
