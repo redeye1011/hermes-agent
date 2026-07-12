@@ -259,6 +259,16 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
         // A permanently incomplete placeholder is not an agent-visible text turn.
         arr = await toInboundMessages({{ messages: {{ get: async () => placeholder }} }}, new Map(), {{ message: placeholder }}, "+1");
         assert(arr.length === 0, "unhydrated placeholder suppressed");
+
+        // A transient lookup outage must escape to the sidecar stream recovery
+        // path rather than silently dropping a voice message.
+        let lookupFailed = false;
+        try {{
+          await toInboundMessages({{ messages: {{ get: async () => {{ throw new Error("temporary Photon lookup failure"); }} }} }}, new Map(), {{ message: placeholder }}, "+1");
+        }} catch {{
+          lookupFailed = true;
+        }}
+        assert(lookupFailed, "transient placeholder lookup is retried by stream recovery");
         """
     )
     run = subprocess.run(
