@@ -3496,6 +3496,15 @@ class BasePlatformAdapter(ABC):
                 logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
         return safe_paths
 
+    @staticmethod
+    def exclude_media_duplicate_local_paths(media_files, local_files) -> List[str]:
+        """Remove bare paths already queued by an explicit MEDIA directive."""
+        media_realpaths = {os.path.realpath(path) for path, _is_voice in media_files or []}
+        return [
+            path for path in local_files or []
+            if os.path.realpath(path) not in media_realpaths
+        ]
+
 
     @staticmethod
     def _mask_protected_spans(content: str) -> str:
@@ -4922,29 +4931,19 @@ class BasePlatformAdapter(ABC):
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
-                    # A reply can contain a bare path as well as the MEDIA: tag
-                    # auto-appended from the same tool result.  MEDIA delivery
-                    # already owns that file; retaining it in ``local_files``
-                    # would send the raw source as a document after the native
-                    # audio path (e.g. MP3 plus Photon-converted M4A).
                     if media_files and local_files:
-                        media_realpaths = {
-                            os.path.realpath(path)
-                            for path, _is_voice in media_files
-                        }
-                        duplicate_local_files = [
-                            path for path in local_files
-                            if os.path.realpath(path) in media_realpaths
-                        ]
-                        if duplicate_local_files:
+                        # A reply can contain a bare path as well as the MEDIA:
+                        # tag auto-appended from the same tool result.  Deliver
+                        # it once through the explicit MEDIA path.
+                        original_local_count = len(local_files)
+                        local_files = self.exclude_media_duplicate_local_paths(
+                            media_files, local_files
+                        )
+                        if len(local_files) != original_local_count:
                             logger.debug(
                                 "[%s] suppressing %d local file(s) already queued via MEDIA",
-                                self.name, len(duplicate_local_files),
+                                self.name, original_local_count - len(local_files),
                             )
-                            local_files = [
-                                path for path in local_files
-                                if os.path.realpath(path) not in media_realpaths
-                            ]
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
