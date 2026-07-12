@@ -1754,10 +1754,13 @@ async def _standalone_send(
                     logger.warning("[photon] standalone send skipping unsafe path")
                     continue
                 guessed, _ = mimetypes.guess_type(safe_path)
+                is_audio = Path(safe_path).suffix.lower() in {
+                    ".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"
+                }
                 att_body: Dict[str, Any] = {
                     "spaceId": chat_id,
                     "path": safe_path,
-                    "kind": "voice" if is_voice else "attachment",
+                    "kind": "voice" if is_voice or is_audio else "attachment",
                 }
                 if guessed:
                     att_body["mimeType"] = guessed
