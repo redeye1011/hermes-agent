@@ -277,6 +277,55 @@ async def test_dispatch_voice_without_bytes_surfaces_marker(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_native_imessage_caf_attachment_as_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """iMessage's blank-MIME Audio Message.caf must reach the voice pipeline."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    raw = b"caff" + b"\x00" * 32
+
+    await adapter._dispatch_inbound(
+        _attachment_event(
+            {
+                "name": "Audio Message.caf",
+                "mimeType": "",
+                "size": len(raw),
+                "data": base64.b64encode(raw).decode("ascii"),
+                "encoding": "base64",
+            }
+        )
+    )
+
+    ev = captured[0]
+    assert ev.message_type == MessageType.VOICE
+    assert ev.text == "(voice)"
+    assert ev.media_types == ["audio/x-caf"]
+    cached = Path(ev.media_urls[0])
+    try:
+        assert cached.parent.name == "audio"
+        assert cached.suffix == ".caf"
+        assert cached.read_bytes() == raw
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_blank_mime_attachment_remains_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the native iMessage CAF signature is promoted to voice."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_inbound(
+        _attachment_event({"name": "recording.caf", "mimeType": "", "size": 1})
+    )
+
+    assert captured[0].message_type == MessageType.DOCUMENT
+
+
+@pytest.mark.asyncio
 async def test_dispatch_attachment_downloads_document(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
