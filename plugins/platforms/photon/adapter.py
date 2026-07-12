@@ -586,6 +586,17 @@ class PhotonAdapter(BasePlatformAdapter):
         except json.JSONDecodeError:
             logger.debug("[photon] skipping non-JSON inbound line")
             return
+        content = event.get("content") or {}
+        text = content.get("text")
+        if (
+            content.get("type") == "text"
+            and isinstance(text, str)
+            and "\ufffc" in text
+            and not text.replace("\ufffc", "").strip()
+        ):
+            # ponytail: leave this ID un-deduped so a hydrated replay can arrive.
+            logger.info("[photon] suppressing attachment placeholder msg_id=%s", event.get("messageId"))
+            return
         msg_id = event.get("messageId")
         if msg_id and self._is_duplicate(msg_id):
             return
