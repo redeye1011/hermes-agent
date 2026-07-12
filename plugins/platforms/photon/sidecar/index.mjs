@@ -58,6 +58,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { prepareVoiceMedia } from "./voice-media.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -743,32 +744,40 @@ const server = http.createServer(async (req, res) => {
       }
       const space = await resolveSpace(spaceId);
 
-      // spectrum-ts infers name + MIME from the file extension; pass
-      // overrides only when Hermes supplied them so a known-good
-      // inference isn't clobbered with an empty string.
-      const opts = {};
-      if (name) opts.name = name;
-      if (mimeType) opts.mimeType = mimeType;
-      const builder =
-        kind === "voice"
-          ? voice(path, Object.keys(opts).length ? opts : undefined)
-          : attachment(path, Object.keys(opts).length ? opts : undefined);
-
-      const result = await space.send(builder);
-
-      // iMessage delivers the caption as a separate bubble; send it
-      // after the media so the attachment renders first.
-      if (caption && typeof caption === "string") {
-        try {
-          await space.send(spectrumText(caption));
-        } catch (e) {
-          console.error(
-            "photon-sidecar: attachment sent but caption failed: " +
-              (e && e.stack ? e.stack : String(e))
-          );
+      const voiceMedia =
+        kind === "voice" ? await prepareVoiceMedia({ path, name, mimeType }) : null;
+      try {
+        // spectrum-ts infers name + MIME from the file extension; pass
+        // overrides only when Hermes supplied them so a known-good
+        // inference isn't clobbered with an empty string.
+        const opts = {};
+        if (voiceMedia?.name ?? name) opts.name = voiceMedia?.name ?? name;
+        if (voiceMedia?.mimeType ?? mimeType) {
+          opts.mimeType = voiceMedia?.mimeType ?? mimeType;
         }
+        const builder =
+          kind === "voice"
+            ? voice(voiceMedia.path, Object.keys(opts).length ? opts : undefined)
+            : attachment(path, Object.keys(opts).length ? opts : undefined);
+
+        const result = await space.send(builder);
+
+        // iMessage delivers the caption as a separate bubble; send it
+        // after the media so the attachment renders first.
+        if (caption && typeof caption === "string") {
+          try {
+            await space.send(spectrumText(caption));
+          } catch (e) {
+            console.error(
+              "photon-sidecar: attachment sent but caption failed: " +
+                (e && e.stack ? e.stack : String(e))
+            );
+          }
+        }
+        return ok(res, { messageId: result?.id || null });
+      } finally {
+        await voiceMedia?.cleanup();
       }
-      return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/react") {
       const { spaceId, messageId, emoji } = body || {};
