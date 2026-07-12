@@ -1,6 +1,7 @@
 """Regression tests for Hermes' Spectrum mixed text+attachment workaround."""
 from __future__ import annotations
 
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -200,6 +201,49 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     )
     assert again.returncode == 0, again.stderr
     assert chunk.read_text(encoding="utf-8") == patched
+
+
+def test_spectrum_patch_upgrades_legacy_placeholder_hydration(tmp_path: Path) -> None:
+    """A sidecar restart must migrate an already-patched 8.x mapper."""
+    chunk = _write_fixture(tmp_path)
+    first = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+
+    current = chunk.read_text(encoding="utf-8")
+    legacy, replacements = re.subn(
+        r"\t\tlet refreshError;\n\t\tlet confirmedPlaceholder = false;\n\t\tfor \(let attempt = 0;.*?\n\t\tif \(isPlaceholderOnly\(sourceMessage\)\) \{\n\t\t\tif \(refreshError && !confirmedPlaceholder\) throw refreshError;\n\t\t\treturn \[\];\n\t\t\}",
+        "\t\tfor (let attempt = 0; attempt < ATTACHMENT_JOIN_RETRY_LIMIT; attempt += 1) {\n\t\t\tawait setTimeout$1(ATTACHMENT_JOIN_RETRY_DELAY_MS);\n\t\t\ttry {\n\t\t\t\tconst refreshed = await client.messages.get(toMessageGuid(sourceMessage.guid));\n\t\t\t\tif (refreshed) sourceMessage = refreshed;\n\t\t\t} catch {}\n\t\t\tif (!isPlaceholderOnly(sourceMessage)) break;\n\t\t}\n\t\tif (isPlaceholderOnly(sourceMessage)) return [];",
+        current,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert replacements == 1
+    chunk.write_text(
+        legacy.replace(
+            "Hydrate placeholder-only iMessage attachments v2",
+            "Hydrate placeholder-only iMessage attachments",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    upgrade = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert upgrade.returncode == 0, upgrade.stderr
+    migrated = chunk.read_text(encoding="utf-8")
+    assert "Hydrate placeholder-only iMessage attachments v2" in migrated
+    assert "refreshError ??= error" in migrated
 
 
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
