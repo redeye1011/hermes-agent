@@ -19,7 +19,8 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MIXED_MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
-const HYDRATION_MARKER = "Hermes patch: Hydrate placeholder-only iMessage attachments";
+const HYDRATION_MARKER_V1 = "Hermes patch: Hydrate placeholder-only iMessage attachments";
+const HYDRATION_MARKER = "Hermes patch: Hydrate placeholder-only iMessage attachments v2";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -105,6 +106,15 @@ function patchInbound(source) {
 }
 
 function patchRemotePlaceholderHydration(source) {
+  const legacy = `\t\tfor (let attempt = 0; attempt < ATTACHMENT_JOIN_RETRY_LIMIT; attempt += 1) {\n\t\t\tawait setTimeout$1(ATTACHMENT_JOIN_RETRY_DELAY_MS);\n\t\t\ttry {\n\t\t\t\tconst refreshed = await client.messages.get(toMessageGuid(sourceMessage.guid));\n\t\t\t\tif (refreshed) sourceMessage = refreshed;\n\t\t\t} catch {}\n\t\t\tif (!isPlaceholderOnly(sourceMessage)) break;\n\t\t}\n\t\tif (isPlaceholderOnly(sourceMessage)) return [];`;
+  if (source.includes(legacy)) {
+    return replaceOnce(
+      source,
+      legacy,
+      `\t\tlet refreshError;\n\t\tlet confirmedPlaceholder = false;\n\t\tfor (let attempt = 0; attempt < ATTACHMENT_JOIN_RETRY_LIMIT; attempt += 1) {\n\t\t\tawait setTimeout$1(ATTACHMENT_JOIN_RETRY_DELAY_MS);\n\t\t\ttry {\n\t\t\t\tconst refreshed = await client.messages.get(toMessageGuid(sourceMessage.guid));\n\t\t\t\tif (refreshed) {\n\t\t\t\t\tsourceMessage = refreshed;\n\t\t\t\t\tconfirmedPlaceholder = isPlaceholderOnly(sourceMessage);\n\t\t\t\t}\n\t\t\t} catch (error) {\n\t\t\t\trefreshError ??= error;\n\t\t\t}\n\t\t\tif (!isPlaceholderOnly(sourceMessage)) break;\n\t\t}\n\t\tif (isPlaceholderOnly(sourceMessage)) {\n\t\t\tif (refreshError && !confirmedPlaceholder) throw refreshError;\n\t\t\treturn [];\n\t\t}`,
+      "legacy remote placeholder hydration"
+    );
+  }
   return replaceOnce(
     source,
     `\tconst base = buildMessageBase(event.message, event.chatGuid, event.occurredAt, phone);\n\tconst messageGuidStr = event.message.guid;\n\tconst attachments = messageAttachments(event.message);\n\tconst text2 = event.message.content.text;\n\tif (attachments.length === 1) {`,
@@ -165,8 +175,11 @@ export function patchSpectrumTs(root = scriptDir()) {
       patched = patchChildIndices(patched);
       patched = `// ${MIXED_MARKER}\n${patched}`;
     }
+    const migratingHydration = patched.includes(HYDRATION_MARKER_V1);
     patched = patchRemotePlaceholderHydration(patched);
-    patched = `// ${HYDRATION_MARKER}\n${patched}`;
+    patched = migratingHydration
+      ? patched.replace(HYDRATION_MARKER_V1, HYDRATION_MARKER)
+      : `// ${HYDRATION_MARKER}\n${patched}`;
     if (usedCRLF) {
       patched = patched.split("\n").join(CRLF);
     }
