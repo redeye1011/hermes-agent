@@ -136,6 +136,64 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_photon_keeps_only_latest_tts_attachment_and_preserves_spoken_text(self):
+        """Photon sends one converted voice attachment plus the complete spoken text."""
+        from gateway.run import (
+            _collect_auto_append_media_tags,
+            _collect_auto_append_tts_text,
+            _ensure_photon_tts_text_reply,
+        )
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tts_1",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": '{"text": "First spoken draft."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tts_1",
+                "content": '{"media_tag": "MEDIA:/tmp/first.mp3"}',
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tts_2",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": '{"text": "The complete final spoken reply."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tts_2",
+                "content": '{"media_tag": "MEDIA:/tmp/final.mp3"}',
+            },
+            {"role": "assistant", "content": "Audio ready."},
+        ]
+
+        tags, _voice = _collect_auto_append_media_tags(
+            messages, history_offset=0, keep_latest_tts_only=True
+        )
+        assert tags == ["MEDIA:/tmp/final.mp3"]
+        assert _collect_auto_append_tts_text(messages, history_offset=0) == (
+            "The complete final spoken reply."
+        )
+        assert _ensure_photon_tts_text_reply(
+            "Audio ready.", "The complete final spoken reply."
+        ) == "Audio ready.\n\nThe complete final spoken reply."
+
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
