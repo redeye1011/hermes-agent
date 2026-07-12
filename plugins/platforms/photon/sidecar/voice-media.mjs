@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import ffmpegStatic from "ffmpeg-static";
 
 const execFileAsync = promisify(execFile);
-const IMESSAGE_VOICE_EXTENSIONS = new Set([".aac", ".m4a"]);
+const IMESSAGE_M4A_EXTENSION = ".m4a";
 
 function m4aName(name, sourcePath) {
   const stem = parse(name || basename(sourcePath)).name || "voice";
@@ -14,8 +14,13 @@ function m4aName(name, sourcePath) {
 }
 
 export async function prepareVoiceMedia({ path, name, mimeType, ffmpegPath = ffmpegStatic }) {
-  if (IMESSAGE_VOICE_EXTENSIONS.has(extname(path).toLowerCase())) {
-    return { path, name, mimeType, cleanup: async () => {} };
+  if (extname(path).toLowerCase() === IMESSAGE_M4A_EXTENSION) {
+    return {
+      path,
+      name: m4aName(name, path),
+      mimeType: undefined,
+      cleanup: async () => {},
+    };
   }
   if (!ffmpegPath) {
     throw new Error("Photon voice conversion failed: ffmpeg-static is unavailable");
