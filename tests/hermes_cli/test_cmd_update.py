@@ -1094,3 +1094,47 @@ def test_update_node_dependencies_installs_photon_sidecar(tmp_path, monkeypatch)
     hm._update_node_dependencies()
 
     assert any(cwd == sidecar_dir for _npm, cwd, _kwargs in installs)
+
+
+def test_update_node_dependencies_continues_to_photon_after_root_failure(tmp_path, monkeypatch):
+    """A root workspace warning must not skip the independent Photon sidecar."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    installs = []
+
+    def fake_install(npm, cwd, **kwargs):
+        installs.append(cwd)
+        return subprocess.CompletedProcess([npm], 1 if cwd == tmp_path else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+
+    assert hm._update_node_dependencies() is True
+    assert sidecar_dir in installs
+
+
+def test_update_node_dependencies_fails_when_photon_sidecar_sync_fails(tmp_path, monkeypatch):
+    """Update must not continue toward a gateway restart with stale sidecar deps."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    def fake_install(npm, cwd, **kwargs):
+        return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+
+    assert hm._update_node_dependencies() is False
