@@ -684,7 +684,7 @@ class PhotonAdapter(BasePlatformAdapter):
             is_native_imessage_voice = (
                 payload.get("type") == "attachment"
                 and name.lower() == "audio message.caf"
-                and not mime.strip()
+                and mime.strip().lower() in {"", "application/octet-stream"}
             )
             is_voice = payload.get("type") == "voice" or is_native_imessage_voice
             if is_native_imessage_voice:
