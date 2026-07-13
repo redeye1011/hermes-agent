@@ -59,6 +59,7 @@ import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { prepareVoiceMedia } from "./voice-media.mjs";
+import { readInboundAttachmentWithRetry } from "./inbound-media.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -383,7 +384,9 @@ async function normalizeBinaryContent(content) {
   }
   if (typeof content.read === "function") {
     try {
-      const buf = await content.read();
+      const buf = await readInboundAttachmentWithRetry(
+        () => content.read(),
+      );
       // Guard the case where size was unknown but the bytes turn out to be
       // over the cap.
       if (buf && buf.length > MAX_INLINE_ATTACHMENT_BYTES) {
