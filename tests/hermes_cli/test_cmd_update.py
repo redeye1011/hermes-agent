@@ -1220,3 +1220,33 @@ def test_zip_update_failure_does_not_resume_paused_windows_gateway(tmp_path, mon
         hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
 
     assert resumed == []
+
+
+def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path, monkeypatch):
+    """Normal Windows updates must not revive the gateway after sidecar failure."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm, "_update_node_dependencies", lambda: False)
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+    monkeypatch.setattr(hm.subprocess, "run", _make_run_side_effect(commit_count="1"))
+
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
