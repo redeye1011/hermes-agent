@@ -524,12 +524,13 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# ff-only fallback on diverged history
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
+    local_commit_count="0",
     ff_only_fails=False,
     reset_fails=False,
     fetch_fails=False,
@@ -549,6 +550,8 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-list" in joined and "origin/main..HEAD" in joined:
+            return SimpleNamespace(stdout=f"{local_commit_count}\n", stderr="", returncode=0)
         if "rev-list" in joined:
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "--ff-only" in joined:
@@ -569,7 +572,7 @@ def _make_update_side_effect(
 
 
 def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+    """When no local commits exist, a rewritten remote can be reset safely."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -584,6 +587,24 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
+
+
+def test_cmd_update_never_resets_committed_local_divergence(monkeypatch, tmp_path, capsys):
+    """Standard update must preserve committed local fixes when main advances."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="23",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert not [cmd for cmd in recorded if "reset" in cmd and "--hard" in cmd]
+    assert "23 local commit" in capsys.readouterr().out
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
