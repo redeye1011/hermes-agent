@@ -9309,6 +9309,15 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 
+def _suppress_windows_gateway_resume(token: dict | None) -> None:
+    """Keep paused Windows gateways down after an unsafe update failure."""
+    if not token:
+        return
+    token["resume_needed"] = False
+    import atexit
+    atexit.unregister(_resume_windows_gateways_after_update)
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -9620,9 +9629,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         try:
             _update_via_zip(args)
         except BaseException:
-            if _windows_gateway_resume:
-                import atexit as _atexit
-                _atexit.unregister(_resume_windows_gateways_after_update)
+            _suppress_windows_gateway_resume(_windows_gateway_resume)
             raise
         else:
             _resume_windows_gateways_after_update(_windows_gateway_resume)
@@ -10061,6 +10068,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refresh_active_lazy_features()
 
         if not _update_node_dependencies():
+            _suppress_windows_gateway_resume(_windows_gateway_resume)
             print()
             print("✗ Update stopped: Photon sidecar dependencies are not ready.")
             print("  The gateway was not restarted. Fix npm/the sidecar install, then rerun `hermes update`.")
