@@ -9803,11 +9803,42 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+                # Never use reset --hard until we know this checkout has no
+                # committed local work. A fast-forward failure is normal when a
+                # user keeps local fixes on main; resetting in that case silently
+                # discards those commits.
+                local_ahead_result = subprocess.run(
+                    git_cmd + ["rev-list", f"origin/{branch}..HEAD", "--count"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                try:
+                    local_ahead = (
+                        int(local_ahead_result.stdout.strip())
+                        if local_ahead_result.returncode == 0
+                        else None
+                    )
+                except ValueError:
+                    local_ahead = None
+
+                if local_ahead is None or local_ahead > 0:
+                    print("✗ Fast-forward not possible; preserving committed local work.")
+                    if local_ahead is None:
+                        print("  Could not determine whether local commits are ahead of the remote.")
+                    else:
+                        print(
+                            f"  This checkout has {local_ahead} local commit(s) not on origin/{branch}."
+                        )
+                    print("  Push or rebase those commits before running `hermes update` again.")
+                    print(f"  Inspect them with: git log --oneline origin/{branch}..HEAD")
+                    sys.exit(1)
+
+                # No committed local work is ahead. This is a rewritten remote
+                # history, so reset is safe and preserves the historical recovery
+                # behavior for managed installs.
                 print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    "  ⚠ Fast-forward not possible (remote history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
                     git_cmd + ["reset", "--hard", f"origin/{branch}"],

@@ -190,9 +190,9 @@ Common issues:
   credentials and pairing state remain in `~/.hermes`, so setup is not rerun.
 - Use `hermes update --check` before updating. `hermes update --backup` updates
   dependencies/configuration and restarts the gateway while preserving
-  `~/.hermes` state. If you maintain local source commits, commit or push them
-  before updating so Git can report any upstream conflict instead of leaving
-  uncommitted work ambiguous.
+  `~/.hermes` state. If this checkout has committed local source changes,
+  a divergent update now refuses to hard-reset them; push or rebase those
+  commits first, then rerun the update.
 
 After a restart or update, send two short voice notes and verify each receives
 complete text plus one playable M4A attachment.
