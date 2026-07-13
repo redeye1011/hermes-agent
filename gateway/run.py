@@ -15629,7 +15629,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    # ponytail: transcript is echoed separately; avoid sending it twice.
+                    enriched_parts.append(
+                        f'"{transcript}"\n\n'
+                        "[The transcript above was already sent to the user. "
+                        "Reply to it without repeating it.]"
+                    )
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
