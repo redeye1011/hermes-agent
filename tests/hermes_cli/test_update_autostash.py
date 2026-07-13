@@ -537,7 +537,10 @@ def _make_update_side_effect(
     fetch_stderr="",
     push_remote="",
     push_fails=False,
+    mirror_fails=False,
     rebase_fails=False,
+    abort_fails=False,
+    head_sha="abc123def456",
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
@@ -551,6 +554,8 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout=f"{head_sha}\n", stderr="", returncode=0)
         if "config" in joined and "pushRemote" in joined:
             return SimpleNamespace(
                 stdout=f"{push_remote}\n" if push_remote else "",
@@ -572,13 +577,23 @@ def _make_update_side_effect(
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
         if "push" in joined:
+            if "--force-with-lease" in joined and mirror_fails:
+                return SimpleNamespace(stdout="", stderr="lease rejected\n", returncode=1)
             if push_fails:
                 return SimpleNamespace(stdout="", stderr="push failed\n", returncode=1)
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if "rebase" in joined and "--abort" not in joined:
-            if rebase_fails:
-                return SimpleNamespace(stdout="", stderr="conflict\n", returncode=1)
-            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rebase" in joined:
+            if "--abort" in joined:
+                return SimpleNamespace(
+                    stdout="",
+                    stderr="abort failed\n" if abort_fails else "",
+                    returncode=1 if abort_fails else 0,
+                )
+            return SimpleNamespace(
+                stdout="",
+                stderr="conflict\n" if rebase_fails else "",
+                returncode=1 if rebase_fails else 0,
+            )
         if "reset" in joined and "--hard" in joined:
             if reset_fails:
                 return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
@@ -610,6 +625,15 @@ def test_cmd_update_never_resets_committed_local_divergence(monkeypatch, tmp_pat
     """Standard update must preserve committed local fixes when main advances."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restore_calls.append(1) or True,
+    )
 
     side_effect, recorded = _make_update_side_effect(
         ff_only_fails=True,
@@ -621,6 +645,7 @@ def test_cmd_update_never_resets_committed_local_divergence(monkeypatch, tmp_pat
         hermes_main.cmd_update(SimpleNamespace())
 
     assert not [cmd for cmd in recorded if "reset" in cmd and "--hard" in cmd]
+    assert restore_calls == [1]
     assert "23 local commit" in capsys.readouterr().out
 
 
@@ -647,7 +672,7 @@ def test_cmd_update_backs_up_and_rebases_committed_local_divergence(
         [
             "git",
             "push",
-            "--force-with-lease",
+            "--force-with-lease=refs/heads/main:abc123def456",
             "fork",
             "HEAD:refs/heads/main",
         ],
@@ -665,6 +690,15 @@ def test_cmd_update_stops_before_rebase_when_backup_push_fails(
     """A failed backup push must leave local commit history untouched."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restore_calls.append(1) or True,
+    )
 
     side_effect, recorded = _make_update_side_effect(
         ff_only_fails=True,
@@ -678,6 +712,7 @@ def test_cmd_update_stops_before_rebase_when_backup_push_fails(
         hermes_main.cmd_update(SimpleNamespace())
 
     assert not [cmd for cmd in recorded if "rebase" in cmd]
+    assert restore_calls == [1]
     assert "stopped before rebase" in capsys.readouterr().out
 
 
@@ -701,6 +736,73 @@ def test_cmd_update_aborts_conflicted_rebase_and_keeps_backup(
 
     assert ["git", "rebase", "--abort"] in recorded
     assert "Backup remains available on fork/main" in capsys.readouterr().out
+
+
+def test_cmd_update_reports_failed_rebase_abort(monkeypatch, tmp_path, capsys):
+    """Never claim restoration when git rebase --abort itself fails."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, _ = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        rebase_fails=True,
+        abort_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "automatic abort failed" in out
+    assert "original local history was restored" not in out
+
+
+def test_cmd_update_rolls_back_when_explicit_lease_rejects_mirror(
+    monkeypatch, tmp_path, capsys
+):
+    """A concurrent fork update must roll local HEAD back before exiting."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        mirror_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "reset", "--hard", "abc123def456"] in recorded
+    assert "local rebase was rolled back" in capsys.readouterr().out
+
+
+def test_cmd_update_validates_syntax_before_mirroring_rebased_history(
+    monkeypatch, tmp_path
+):
+    """A bad upstream checkout must leave fork/main on its pre-rebase SHA."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_validate_critical_files_syntax",
+        lambda _root: (False, "hermes_cli/main.py", "bad syntax"),
+    )
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    push_calls = [cmd for cmd in recorded if "push" in cmd]
+    assert push_calls == [["git", "push", "fork", "HEAD:refs/heads/main"]]
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
