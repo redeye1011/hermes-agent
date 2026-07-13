@@ -277,10 +277,12 @@ async def test_dispatch_voice_without_bytes_surfaces_marker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mime_type", ["", "application/octet-stream"])
 async def test_dispatch_native_imessage_caf_attachment_as_voice(
     monkeypatch: pytest.MonkeyPatch,
+    mime_type: str,
 ) -> None:
-    """iMessage's blank-MIME Audio Message.caf must reach the voice pipeline."""
+    """iMessage's CAF Audio Message must reach the voice pipeline."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
     raw = b"caff" + b"\x00" * 32
@@ -289,7 +291,7 @@ async def test_dispatch_native_imessage_caf_attachment_as_voice(
         _attachment_event(
             {
                 "name": "Audio Message.caf",
-                "mimeType": "",
+                "mimeType": mime_type,
                 "size": len(raw),
                 "data": base64.b64encode(raw).decode("ascii"),
                 "encoding": "base64",
