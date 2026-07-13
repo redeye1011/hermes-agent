@@ -21,8 +21,9 @@ npm ci
 ```
 
 `npm ci` installs the committed lockfile exactly. Hermes setup/update falls
-back to `npm install` only if the lockfile is absent or temporarily drifted.
-The canonical first-time path is `hermes gateway setup`.
+back to `npm install` if `npm ci` fails (for example, when the lockfile is
+absent or temporarily drifted). The canonical first-time path is
+`hermes gateway setup`.
 
 ## Run standalone
 

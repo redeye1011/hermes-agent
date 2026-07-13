@@ -963,8 +963,8 @@ def test_update_node_dependencies_continues_to_photon_after_root_failure(tmp_pat
     assert sidecar_dir in installs
 
 
-def test_update_node_dependencies_fails_when_photon_sidecar_sync_fails(tmp_path, monkeypatch):
-    """Update must not continue toward a gateway restart with stale sidecar deps."""
+def test_update_node_dependencies_ignores_sidecar_sync_failure_when_photon_unconfigured(tmp_path, monkeypatch):
+    """An unused bundled plugin must not block a non-Photon update."""
     from hermes_cli import main as hm
 
     sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
@@ -979,5 +979,56 @@ def test_update_node_dependencies_fails_when_photon_sidecar_sync_fails(tmp_path,
         return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
 
     monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda name: None)
+
+    assert hm._update_node_dependencies() is True
+
+
+def test_update_node_dependencies_fails_when_configured_photon_sidecar_sync_fails(tmp_path, monkeypatch):
+    """Configured Photon must not restart with stale Spectrum/ffmpeg deps."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value",
+        lambda name: "configured-project" if name == "PHOTON_PROJECT_ID" else None,
+    )
+
+    def fake_install(npm, cwd, **kwargs):
+        return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
 
     assert hm._update_node_dependencies() is False
+
+
+def test_zip_update_failure_does_not_resume_paused_windows_gateway(tmp_path, monkeypatch):
+    """A failed ZIP update must leave the gateway stopped rather than restart stale code."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: {"paused": True})
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+
+    resumed = []
+    monkeypatch.setattr(hm, "_resume_windows_gateways_after_update", lambda state: resumed.append(state))
+
+    def fail_zip(args):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(hm, "_update_via_zip", fail_zip)
+
+    with pytest.raises(SystemExit):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert resumed == []
