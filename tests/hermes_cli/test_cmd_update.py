@@ -35,7 +35,18 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
 
 @pytest.fixture
-def mock_args():
+def mock_args(monkeypatch):
+    """Use an unconfigured Photon environment for generic updater tests."""
+    import hermes_cli.config as config
+
+    original_get_env_value = config.get_env_value
+
+    def get_env_value_without_photon(name, *args, **kwargs):
+        if name == "PHOTON_PROJECT_ID":
+            return None
+        return original_get_env_value(name, *args, **kwargs)
+
+    monkeypatch.setattr(config, "get_env_value", get_env_value_without_photon)
     return SimpleNamespace()
 
 
@@ -880,6 +891,26 @@ termux = ["rich>=14"]
 
     assert hm._load_installable_optional_extras(group="all") == ["mcp"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+
+
+@patch("shutil.which", return_value=None)
+@patch("subprocess.run")
+def test_cmd_update_does_not_continue_when_photon_sidecar_sync_fails(
+    mock_run, _mock_which, mock_args, capsys
+):
+    """A failed sidecar sync must stop before builds, completion, or restart."""
+    from hermes_cli import main as hm
+
+    mock_run.side_effect = _make_run_side_effect(branch="main", verify_ok=True, commit_count="1")
+    with patch.object(hm, "_update_node_dependencies", return_value=False), patch.object(
+        hm, "_build_web_ui"
+    ) as build_web:
+        cmd_update(mock_args)
+
+    build_web.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Photon sidecar dependencies are not ready" in out
+    assert "gateway was not restarted" in out
 
 
 def test_update_node_dependencies_installs_photon_sidecar(tmp_path, monkeypatch):

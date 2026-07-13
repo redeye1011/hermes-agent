@@ -6400,7 +6400,10 @@ def _update_via_zip(args):
             )
         _install_python_dependencies_with_optional_fallback(pip_cmd)
 
-    _update_node_dependencies()
+    if not _update_node_dependencies():
+        print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+        print("  The gateway was not restarted. Fix npm/the sidecar install, then rerun `hermes update`.")
+        sys.exit(1)
     _build_web_ui(PROJECT_ROOT / "web")
 
     # Sync skills
@@ -8126,15 +8129,28 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     return resolve_uv() or shutil.which("uv")
 
 
-def _update_node_dependencies() -> None:
+def _update_node_dependencies() -> bool:
+    """Refresh Node dependencies and report whether Photon is safe to restart."""
     from hermes_constants import find_node_executable, with_hermes_node_path
 
     npm = find_node_executable("npm")
+    photon_sidecar_dir = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
     if not npm:
-        return
+        # A source checkout can include the plugin without the user configuring
+        # Photon. Only block a gateway restart when Photon is actually enabled
+        # and its required Node dependency sync cannot run.
+        try:
+            from hermes_cli.config import get_env_value
+            photon_configured = bool(get_env_value("PHOTON_PROJECT_ID"))
+        except Exception:
+            photon_configured = bool(os.environ.get("PHOTON_PROJECT_ID"))
+        if photon_configured and (photon_sidecar_dir / "package.json").exists():
+            print("  ⚠ Photon sidecar dependencies could not be checked: npm is unavailable")
+            return False
+        return True
 
     if not (PROJECT_ROOT / "package.json").exists():
-        return
+        return True
 
     # With a single workspace lockfile the root install would cover ALL
     # workspaces — but apps/desktop pulls in Electron as a devDependency,
@@ -8167,7 +8183,9 @@ def _update_node_dependencies() -> None:
         stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
-        return
+        # Photon has an independent lockfile. Continue to its explicit sync so
+        # an unrelated root/workspace warning does not leave voice transport
+        # dependencies stale.
 
     # Step 2: install only the workspaces update needs (ui-tui, web).
     # --workspace selects specific workspaces; the rest (desktop) are skipped.
@@ -8191,7 +8209,6 @@ def _update_node_dependencies() -> None:
     # package-lock.json for Spectrum and ffmpeg-static. Refresh it explicitly
     # so a normal Hermes update cannot leave code and native voice dependencies
     # at different revisions.
-    photon_sidecar_dir = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
     if (photon_sidecar_dir / "package.json").exists():
         sidecar_result = _run_npm_install_deterministic(
             npm,
@@ -8207,6 +8224,9 @@ def _update_node_dependencies() -> None:
             stderr = (sidecar_result.stderr or "").strip() if sidecar_result.stderr else ""
             if stderr:
                 print(f"    {stderr.splitlines()[-1]}")
+            return False
+
+    return True
 
 
 class _UpdateOutputStream:
@@ -10031,7 +10051,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _refresh_active_lazy_features()
 
-        _update_node_dependencies()
+        if not _update_node_dependencies():
+            print()
+            print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+            print("  The gateway was not restarted. Fix npm/the sidecar install, then rerun `hermes update`.")
+            return
         _build_web_ui(PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
