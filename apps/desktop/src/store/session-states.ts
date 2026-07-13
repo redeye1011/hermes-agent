@@ -246,6 +246,20 @@ export function closeSessionTile(storedSessionId: string) {
   saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
 }
 
+/** Drop a DEAD tile — a persisted tile whose session no longer exists on the
+ *  backend (resume 404s). Unlike close, it leaves no ⌘⇧T undo (resurrecting it
+ *  would just 404 again) and evicts any cached state. This is what clears the
+ *  "Session not found" resume spam from stale/cross-profile persisted tiles. */
+export function discardSessionTile(storedSessionId: string) {
+  const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
+
+  if (runtimeId) {
+    dropSessionState(runtimeId)
+  }
+
+  saveTiles($sessionTiles.get().filter(t => t.storedSessionId !== storedSessionId))
+}
+
 /** ⌘⇧T — reopen the most recently closed tab where it was. Skips ids that are
  *  live again (reopened, or now the primary). */
 export function reopenLastClosedTile(): void {

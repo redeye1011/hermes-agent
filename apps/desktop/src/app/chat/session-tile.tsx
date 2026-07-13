@@ -44,6 +44,7 @@ import {
   $sessionStates,
   $sessionTiles,
   closeSessionTile,
+  discardSessionTile,
   patchSessionTile,
   type SessionTile,
   sessionTileDelegate
@@ -190,7 +191,16 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       .resumeTile(storedSessionId)
       .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
       .catch((err: unknown) => {
-        patchSessionTile(storedSessionId, { error: err instanceof Error ? err.message : String(err) })
+        const message = err instanceof Error ? err.message : String(err)
+
+        // A gone session (404 / "Session not found") is terminal — a stale or
+        // cross-profile persisted tile. Discard it instead of latching an error
+        // that re-retries on every reconnect (the "Session not found" spam).
+        if (/session not found|\b404\b/i.test(message)) {
+          discardSessionTile(storedSessionId)
+        } else {
+          patchSessionTile(storedSessionId, { error: message })
+        }
       })
       .finally(() => {
         resumingRef.current = false
