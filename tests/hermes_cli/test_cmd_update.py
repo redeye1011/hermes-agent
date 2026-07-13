@@ -531,9 +531,9 @@ class TestCmdUpdateBranchFallback:
                 (["/usr/bin/npm", "ci", "--workspace", "web", "--silent"], PROJECT_ROOT),
             ]
 
-        # Gateway updates refresh runtime dependencies only; the website build is
-        # handled by its own documentation/deployment workflow.
-        mock_idle.assert_not_called()
+        # Standard source updates rebuild the web UI through the idle-timeout
+        # wrapper after dependencies have been refreshed.
+        mock_idle.assert_called_once()
 
         # Regression for #18840: root npm installs must stream output
         # (capture_output=False) so postinstall progress is visible
