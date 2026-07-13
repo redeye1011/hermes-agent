@@ -1196,8 +1196,9 @@ def test_update_node_dependencies_fails_when_configured_photon_sidecar_sync_fail
     assert hm._update_node_dependencies() is False
 
 
-def test_zip_update_failure_does_not_resume_paused_windows_gateway(tmp_path, monkeypatch):
-    """A failed ZIP update must leave the gateway stopped rather than restart stale code."""
+def test_zip_update_configured_sidecar_failure_suppresses_windows_gateway_resume(tmp_path, monkeypatch):
+    """ZIP sidecar failure must cancel both direct and atexit gateway resume."""
+    import atexit
     from hermes_cli import main as hm
 
     monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
@@ -1205,21 +1206,26 @@ def test_zip_update_failure_does_not_resume_paused_windows_gateway(tmp_path, mon
     monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
     monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
     monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
-    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: {"paused": True})
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
     monkeypatch.setattr(hm.sys, "platform", "win32")
 
-    resumed = []
-    monkeypatch.setattr(hm, "_resume_windows_gateways_after_update", lambda state: resumed.append(state))
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
 
-    def fail_zip(args):
-        raise SystemExit(1)
+    def configured_sidecar_failure(args):
+        raise SystemExit("Photon sidecar dependencies are not ready")
 
-    monkeypatch.setattr(hm, "_update_via_zip", fail_zip)
+    monkeypatch.setattr(hm, "_update_via_zip", configured_sidecar_failure)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit, match="Photon sidecar dependencies are not ready"):
         hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
 
-    assert resumed == []
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
 
 
 def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path, monkeypatch):
