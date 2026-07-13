@@ -89,6 +89,15 @@ interface SessionActionsOptions {
   ) => ClientSessionState
 }
 
+// Stored ids created in THIS renderer run. A brand-new session lives only in the
+// gateway's in-memory map until its first turn persists a state.db row — so if a
+// respawning/flapping backend drops it, both resume RPC and the REST transcript
+// 404 even though the user just made it. We must NOT treat that as "gone" (which
+// yanks them to a fresh draft — the "new sessions clear themselves" bug); the
+// bounded retry rebinds it when the backend returns. Boot-into-a-stale-last-id
+// (NOT in this set) still legitimately drops to a draft.
+const createdThisRun = new Set<string>()
+
 // Reflect a stored row's persisted token counts into the live usage atom
 // (total is derived, so callers can't drift it out of sync with input/output).
 function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?: number | null }) {
@@ -255,6 +264,7 @@ export function useSessionActions({
         ensureSessionState(created.session_id, stored)
 
         if (stored) {
+          createdThisRun.add(stored)
           // Seed the sidebar preview with the user's first message so the row
           // reads meaningfully while the turn is in flight, instead of flashing
           // "Untitled session" until the turn persists and auto-title runs. The
@@ -337,6 +347,7 @@ export function useSessionActions({
           return
         }
 
+        createdThisRun.add(stored)
         // Seed the sidebar + per-runtime cache, but DON'T steal the primary
         // selection — this session lives in the tile. Prime it with the create
         // runtime so the tile skips a redundant resume.
@@ -685,6 +696,16 @@ export function useSessionActions({
         // permanently-dead id. (Booting straight into a no-longer-existent
         // last-session id is the common trigger.)
         if ($messages.get().length === 0 && isSessionGoneError(fallbackError)) {
+          // A session created THIS run isn't gone — its backend just flapped
+          // before the turn-less session persisted. Keep the empty view and arm
+          // the bounded retry to rebind, rather than yanking to a fresh draft.
+          // Only a stale id from a PRIOR run drops to a draft.
+          if (createdThisRun.has(storedSessionId)) {
+            setResumeFailedSessionId(storedSessionId)
+
+            return
+          }
+
           startFreshSessionDraft(true)
 
           return
