@@ -69,7 +69,8 @@ The setup, in order:
    user with that number already exists, so re-running is safe.
 5. **Prints your assigned iMessage line** — the number you text to reach
    your agent.
-6. **Runs `npm install`** inside the plugin's sidecar directory.
+6. **Runs `npm ci`** inside the plugin's sidecar directory, falling back to
+   `npm install` only if the lockfile is missing or temporarily drifted.
 
 Runtime credentials are written to `~/.hermes/.env`
 (`PHOTON_PROJECT_ID` = the Spectrum project id, `PHOTON_PROJECT_SECRET`),
@@ -190,10 +191,11 @@ Common issues:
   credentials and pairing state remain in `~/.hermes`, so setup is not rerun.
 - Use `hermes update --check` before updating. `hermes update --backup` updates
   dependencies/configuration and restarts the gateway while preserving
-  `~/.hermes` state. It also synchronizes Photon’s separate sidecar lockfile
-  (`spectrum-ts` and `ffmpeg-static`). If this checkout has committed local
-  source changes, a divergent update now refuses to hard-reset them; push or
-  rebase those commits first, then rerun the update.
+  `~/.hermes` state. It synchronizes Photon’s separate sidecar lockfile
+  (`spectrum-ts` and `ffmpeg-static`) before restarting; if that sync fails,
+  the update stops without restarting the gateway. If this checkout has
+  committed local source changes, a divergent update refuses to hard-reset
+  them; push or rebase those commits first, then rerun the update.
 
 After a restart or update, send two short voice notes and verify each receives
 complete text plus one playable M4A attachment.
