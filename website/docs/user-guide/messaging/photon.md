@@ -49,18 +49,14 @@ That's it — there is no public URL or tunnel to set up.
 
 ## First-time setup
 
-Either run the unified gateway wizard and pick **Photon iMessage**:
+The unified gateway wizard is the canonical Photon setup path:
 
 ```bash
 hermes gateway setup
 ```
 
-…or run the Photon setup directly (the wizard calls the same flow):
-
-```bash
-# Device-code login + project + user + sidecar deps, all in one
-hermes photon setup --phone +15551234567
-```
+The wizard handles device login, Spectrum provisioning, registered-user setup,
+and sidecar dependencies.
 
 The setup, in order:
 
@@ -159,44 +155,52 @@ Send an iMessage to your assigned number and Hermes will reply.
 ## Status & troubleshooting
 
 ```bash
-hermes photon status
+hermes gateway status
 ```
 
-Prints saved credentials, sidecar health, your registered number, and the
-assigned iMessage line Hermes uses. When a Photon token and dashboard project
-are available, `status` refreshes missing number rows from the dashboard
-without provisioning new lines.
+This confirms that the service-managed gateway is active. For Photon-specific
+failures, inspect the gateway log after reproducing the issue:
 
-```
-Photon iMessage status
-──────────────────────
-  device token        : ✓ stored
-  dashboard project   : 3c90c3cc-0d44-4b50-...
-  spectrum project id : sp-...
-  project secret      : ✓ stored
-  my number           : +15551234567
-  assigned number     : +16282679185
-  node binary         : /usr/bin/node
-  sidecar deps        : ✓ installed
+```bash
+grep -Ei 'photon|spectrum|Audio Message|voice|transcrib|failed' \
+  ~/.hermes/logs/gateway.log | tail -n 100
 ```
 
 Common issues:
 
-- **`sidecar deps : ✗ run hermes photon install-sidecar`** — Node is
-  installed but `spectrum-ts` isn't. Run the suggested command.
-- **`device token : ✗ missing`** — run `hermes photon setup` to log in.
-- **`No iMessage line assigned yet`** — Spectrum is enabled but no line
-  has been provisioned; re-run `hermes photon setup` or check the
-  [dashboard][app].
-- **Sidecar won't start** — confirm `node --version` is 18.17+ and that
-  `hermes photon install-sidecar` completed without errors.
+- **Sidecar dependencies unavailable** — re-run `hermes gateway setup` and
+  select Photon; it installs the sidecar dependencies.
+- **Photon credentials missing** — re-run `hermes gateway setup` and complete
+  the Photon device-login flow.
+- **No iMessage line assigned yet** — re-run `hermes gateway setup` or check
+  the [dashboard][app].
+- **Sidecar won't start** — confirm `node --version` is 18.17+ and re-run the
+  Photon section of `hermes gateway setup`.
+
+## Voice notes, restarts, and updates
+
+- Native iMessage voice notes (`Audio Message.caf`) are read by the sidecar,
+  base64-forwarded to Hermes, cached, and transcribed. A transient attachment
+  read is retried three times (250 ms, then 500 ms backoff) before it is
+  treated as metadata-only.
+- Photon replies always keep their text. Voice audio is supplementary and is
+  delivered as one native M4A attachment (`audio/mp4`); MP3 input is converted
+  before upload.
+- A normal `hermes gateway restart` only restarts the service. Photon
+  credentials and pairing state remain in `~/.hermes`, so setup is not rerun.
+- Use `hermes update --check` before updating. `hermes update --backup` updates
+  dependencies/configuration and restarts the gateway while preserving
+  `~/.hermes` state. If you maintain local source commits, commit or push them
+  before updating so Git can report any upstream conflict instead of leaving
+  uncommitted work ambiguous.
+
+After a restart or update, send two short voice notes and verify each receives
+complete text plus one playable M4A attachment.
 
 ## Limits today
 
-- **Inbound attachments are metadata-only.** Inbound events carry the
-  filename + MIME type; the agent sees a marker but can't yet read the
-  bytes. The SDK exposes attachment bytes via `content.read()`, so this
-  is a sidecar follow-up.
+- **Inbound attachments and voice notes** up to the inline size cap (20 MiB by
+  default) are cached for the agent; larger attachments are metadata-only.
 - **Outbound attachments are supported.** Hermes sends images, voice
   notes, video, and documents through spectrum-ts' `attachment()` /
   `voice()` content builders via the sidecar's `/send-attachment`
