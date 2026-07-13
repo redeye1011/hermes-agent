@@ -8187,6 +8187,27 @@ def _update_node_dependencies() -> None:
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
 
+    # Photon is not a root npm workspace: its sidecar owns a dedicated
+    # package-lock.json for Spectrum and ffmpeg-static. Refresh it explicitly
+    # so a normal Hermes update cannot leave code and native voice dependencies
+    # at different revisions.
+    photon_sidecar_dir = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    if (photon_sidecar_dir / "package.json").exists():
+        sidecar_result = _run_npm_install_deterministic(
+            npm,
+            photon_sidecar_dir,
+            extra_args=tuple(extra_args),
+            capture_output=False,
+            env=nixos_env,
+        )
+        if sidecar_result.returncode == 0:
+            print("  ✓ Photon sidecar dependencies")
+        else:
+            print("  ⚠ Photon sidecar dependency install failed")
+            stderr = (sidecar_result.stderr or "").strip() if sidecar_result.stderr else ""
+            if stderr:
+                print(f"    {stderr.splitlines()[-1]}")
+
 
 class _UpdateOutputStream:
     """Stream wrapper used during ``hermes update`` to survive terminal loss.
