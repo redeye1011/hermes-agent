@@ -9832,6 +9832,31 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
+        def _restore_checkout_after_safe_failure() -> None:
+            """Restore pre-update branch/worktree after a non-destructive failure."""
+            nonlocal auto_stash_ref
+            if current_branch not in {branch, "HEAD"}:
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", current_branch],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if checkout_result.returncode != 0:
+                    print(f"  ⚠ Could not restore branch '{current_branch}'.")
+                    return
+            if auto_stash_ref is not None:
+                restored = _restore_stashed_changes(
+                    git_cmd,
+                    PROJECT_ROOT,
+                    auto_stash_ref,
+                    prompt_user=False,
+                    input_fn=gw_input_fn,
+                )
+                if restored:
+                    auto_stash_ref = None
+
         # Check if there are updates
         result = subprocess.run(
             git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
@@ -9947,6 +9972,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
+        rebase_push_remote: Optional[str] = None
+        rebase_backup_sha: Optional[str] = None
         try:
             pull_result = subprocess.run(
                 git_cmd + ["pull", "--ff-only", "origin", branch],
@@ -10004,6 +10031,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             f"  Configure a backup fork first: git config branch.{branch}.pushRemote <remote>"
                         )
                         print("  Then run `hermes update` again to back up and rebase them safely.")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    backup_sha = pre_pull_sha or _capture_head_sha(git_cmd, PROJECT_ROOT)
+                    if not backup_sha:
+                        print("✗ Could not capture the local commit ID; update stopped before rebase.")
+                        _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
                     print(
@@ -10019,6 +10053,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("✗ Could not back up local commits; update stopped before rebase.")
                         if backup_result.stderr.strip():
                             print(f"  {backup_result.stderr.strip()}")
+                        _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
                     print(f"  → Rebasing local commits onto origin/{branch}...")
@@ -10029,37 +10064,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         text=True,
                     )
                     if rebase_result.returncode != 0:
-                        subprocess.run(
+                        abort_result = subprocess.run(
                             git_cmd + ["rebase", "--abort"],
                             cwd=PROJECT_ROOT,
                             capture_output=True,
                             text=True,
                         )
+                        if abort_result.returncode != 0:
+                            print("✗ Rebase conflicted and automatic abort failed.")
+                            if abort_result.stderr.strip():
+                                print(f"  {abort_result.stderr.strip()}")
+                            print(f"  Recover from {push_remote}/{branch} before restarting Hermes.")
+                            sys.exit(1)
                         print("✗ Rebase conflicted; original local history was restored.")
                         if rebase_result.stderr.strip():
                             print(f"  {rebase_result.stderr.strip()}")
                         print(f"  Backup remains available on {push_remote}/{branch}.")
+                        _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
-                    mirror_result = subprocess.run(
-                        git_cmd
-                        + [
-                            "push",
-                            "--force-with-lease",
-                            push_remote,
-                            f"HEAD:refs/heads/{branch}",
-                        ],
-                        cwd=PROJECT_ROOT,
-                        capture_output=True,
-                        text=True,
-                    )
-                    if mirror_result.returncode != 0:
-                        print("✗ Rebase succeeded, but the backup fork could not be updated.")
-                        if mirror_result.stderr.strip():
-                            print(f"  {mirror_result.stderr.strip()}")
-                        print(f"  The pre-rebase backup remains on {push_remote}/{branch}.")
-                        sys.exit(1)
-                    print(f"  ✓ Local commits rebased and mirrored to {push_remote}/{branch}.")
+                    # Keep the fork on the immutable pre-rebase history until
+                    # syntax validation passes. The explicit lease below then
+                    # prevents overwriting a concurrent remote update.
+                    rebase_push_remote = push_remote
+                    rebase_backup_sha = backup_sha
 
                 # No committed local work is ahead. This is a rewritten remote
                 # history, so reset is safe and preserves the historical recovery
@@ -10123,6 +10151,43 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Could not capture pre-pull SHA — recover manually with:")
                     print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
+
+            if rebase_push_remote and rebase_backup_sha:
+                mirror_result = subprocess.run(
+                    git_cmd
+                    + [
+                        "push",
+                        f"--force-with-lease=refs/heads/{branch}:{rebase_backup_sha}",
+                        rebase_push_remote,
+                        f"HEAD:refs/heads/{branch}",
+                    ],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if mirror_result.returncode != 0:
+                    rollback_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", rebase_backup_sha],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if rollback_result.returncode != 0:
+                        print("✗ Backup mirror failed and local rollback also failed.")
+                        if rollback_result.stderr.strip():
+                            print(f"  {rollback_result.stderr.strip()}")
+                        print(
+                            f"  Recover from {rebase_push_remote}/{branch} before restarting Hermes."
+                        )
+                        sys.exit(1)
+                    print("✗ Backup mirror changed concurrently; local rebase was rolled back.")
+                    if mirror_result.stderr.strip():
+                        print(f"  {mirror_result.stderr.strip()}")
+                    _restore_checkout_after_safe_failure()
+                    sys.exit(1)
+                print(
+                    f"  ✓ Local commits rebased and mirrored to {rebase_push_remote}/{branch}."
+                )
 
             update_succeeded = True
         finally:
