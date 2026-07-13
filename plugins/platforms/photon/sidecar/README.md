@@ -11,7 +11,8 @@ The sidecar:
   to push send/typing requests (auth via `X-Hermes-Sidecar-Token`)
 - drains Spectrum's inbound gRPC message stream and forwards normalized
   events to the Python adapter over its loopback-only `/inbound` NDJSON
-  channel; Spectrum owns reconnect and heartbeat handling
+  channel; the SDK handles connection recovery, while the sidecar re-subscribes
+  after stream errors/ends and emits loopback keepalive heartbeats
 
 ## Install
 
