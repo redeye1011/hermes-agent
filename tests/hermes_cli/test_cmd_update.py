@@ -1060,3 +1060,29 @@ termux = ["rich>=14"]
 
     assert hm._load_installable_optional_extras(group="all") == ["mcp"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+
+
+def test_update_node_dependencies_installs_photon_sidecar(tmp_path, monkeypatch):
+    """Photon keeps a separate lockfile outside the root npm workspaces."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    (sidecar_dir / "package-lock.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    installs = []
+
+    def fake_install(npm, cwd, **kwargs):
+        installs.append((npm, cwd, kwargs))
+        return subprocess.CompletedProcess([npm], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+
+    hm._update_node_dependencies()
+
+    assert any(cwd == sidecar_dir for _npm, cwd, _kwargs in installs)
