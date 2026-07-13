@@ -9879,38 +9879,114 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 except ValueError:
                     local_ahead = None
 
-                if local_ahead is None or local_ahead > 0:
+                if local_ahead is None:
                     print("✗ Fast-forward not possible; preserving committed local work.")
-                    if local_ahead is None:
-                        print("  Could not determine whether local commits are ahead of the remote.")
-                    else:
-                        print(
-                            f"  This checkout has {local_ahead} local commit(s) not on origin/{branch}."
-                        )
+                    print("  Could not determine whether local commits are ahead of the remote.")
                     print("  Push or rebase those commits before running `hermes update` again.")
                     print(f"  Inspect them with: git log --oneline origin/{branch}..HEAD")
                     sys.exit(1)
 
+                if local_ahead > 0:
+                    # Never guess a backup destination: pushing to origin/main
+                    # could publish private work or mutate upstream unexpectedly.
+                    push_remote_result = subprocess.run(
+                        git_cmd + ["config", "--get", f"branch.{branch}.pushRemote"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    push_remote = (
+                        push_remote_result.stdout.strip()
+                        if push_remote_result.returncode == 0
+                        else ""
+                    )
+                    if not push_remote:
+                        print("✗ Fast-forward not possible; preserving committed local work.")
+                        print(
+                            f"  This checkout has {local_ahead} local commit(s) not on origin/{branch}."
+                        )
+                        print(
+                            f"  Configure a backup fork first: git config branch.{branch}.pushRemote <remote>"
+                        )
+                        print("  Then run `hermes update` again to back up and rebase them safely.")
+                        sys.exit(1)
+
+                    print(
+                        f"  → Backing up {local_ahead} local commit(s) to {push_remote}/{branch}..."
+                    )
+                    backup_result = subprocess.run(
+                        git_cmd + ["push", push_remote, f"HEAD:refs/heads/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if backup_result.returncode != 0:
+                        print("✗ Could not back up local commits; update stopped before rebase.")
+                        if backup_result.stderr.strip():
+                            print(f"  {backup_result.stderr.strip()}")
+                        sys.exit(1)
+
+                    print(f"  → Rebasing local commits onto origin/{branch}...")
+                    rebase_result = subprocess.run(
+                        git_cmd + ["rebase", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if rebase_result.returncode != 0:
+                        subprocess.run(
+                            git_cmd + ["rebase", "--abort"],
+                            cwd=PROJECT_ROOT,
+                            capture_output=True,
+                            text=True,
+                        )
+                        print("✗ Rebase conflicted; original local history was restored.")
+                        if rebase_result.stderr.strip():
+                            print(f"  {rebase_result.stderr.strip()}")
+                        print(f"  Backup remains available on {push_remote}/{branch}.")
+                        sys.exit(1)
+
+                    mirror_result = subprocess.run(
+                        git_cmd
+                        + [
+                            "push",
+                            "--force-with-lease",
+                            push_remote,
+                            f"HEAD:refs/heads/{branch}",
+                        ],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if mirror_result.returncode != 0:
+                        print("✗ Rebase succeeded, but the backup fork could not be updated.")
+                        if mirror_result.stderr.strip():
+                            print(f"  {mirror_result.stderr.strip()}")
+                        print(f"  The pre-rebase backup remains on {push_remote}/{branch}.")
+                        sys.exit(1)
+                    print(f"  ✓ Local commits rebased and mirrored to {push_remote}/{branch}.")
+
                 # No committed local work is ahead. This is a rewritten remote
                 # history, so reset is safe and preserves the historical recovery
                 # behavior for managed installs.
-                print(
-                    "  ⚠ Fast-forward not possible (remote history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                if local_ahead == 0:
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  ⚠ Fast-forward not possible (remote history diverged), resetting to match remote..."
                     )
-                    sys.exit(1)
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
