@@ -8135,15 +8135,14 @@ def _update_node_dependencies() -> bool:
 
     npm = find_node_executable("npm")
     photon_sidecar_dir = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    # A source checkout can include the plugin without the user configuring
+    # Photon. Only enforce sidecar readiness when the platform is active.
+    try:
+        from hermes_cli.config import get_env_value
+        photon_configured = bool(get_env_value("PHOTON_PROJECT_ID"))
+    except Exception:
+        photon_configured = bool(os.environ.get("PHOTON_PROJECT_ID"))
     if not npm:
-        # A source checkout can include the plugin without the user configuring
-        # Photon. Only block a gateway restart when Photon is actually enabled
-        # and its required Node dependency sync cannot run.
-        try:
-            from hermes_cli.config import get_env_value
-            photon_configured = bool(get_env_value("PHOTON_PROJECT_ID"))
-        except Exception:
-            photon_configured = bool(os.environ.get("PHOTON_PROJECT_ID"))
         if photon_configured and (photon_sidecar_dir / "package.json").exists():
             print("  ⚠ Photon sidecar dependencies could not be checked: npm is unavailable")
             return False
@@ -8224,7 +8223,8 @@ def _update_node_dependencies() -> bool:
             stderr = (sidecar_result.stderr or "").strip() if sidecar_result.stderr else ""
             if stderr:
                 print(f"    {stderr.splitlines()[-1]}")
-            return False
+            if photon_configured:
+                return False
 
     return True
 
@@ -9615,11 +9615,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
 
     if use_zip_update:
-        # ZIP-based update for Windows when git is broken
+        # ZIP-based update for Windows when git is broken. A failed update must
+        # not revive the paused gateway against stale code or dependencies.
         try:
             _update_via_zip(args)
-        finally:
+        except BaseException:
+            if _windows_gateway_resume:
+                import atexit as _atexit
+                _atexit.unregister(_resume_windows_gateways_after_update)
+            raise
+        else:
             _resume_windows_gateways_after_update(_windows_gateway_resume)
+            if _windows_gateway_resume:
+                import atexit as _atexit
+                _atexit.unregister(_resume_windows_gateways_after_update)
         return
 
     # Fetch and pull
