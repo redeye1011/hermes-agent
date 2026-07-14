@@ -256,7 +256,6 @@ class TestCmdUpdateNpmLockfileCache:
         )
         monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
         monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
-        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: default_home)
         monkeypatch.setattr(
             "hermes_cli.profiles.list_profiles",
             lambda: [SimpleNamespace(path=profile_home)],
