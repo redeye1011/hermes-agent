@@ -8257,6 +8257,7 @@ def _photon_configured() -> bool:
         set_hermes_home_override,
     )
     from plugins.platforms.photon.adapter import validate_config
+    from plugins.platforms.photon.auth import load_project_credentials
 
     homes = [Path(get_hermes_home())]
     try:
@@ -8271,6 +8272,9 @@ def _photon_configured() -> bool:
 
         token = set_hermes_home_override(str(home))
         try:
+            project_id, project_secret = load_project_credentials()
+            if project_id and project_secret:
+                return True
             photon = load_gateway_config().platforms.get(Platform("photon"))
             if photon and validate_config(photon):
                 return True

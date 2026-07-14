@@ -251,10 +251,6 @@ class TestCmdUpdateNpmLockfileCache:
             "hermes_cli.profiles.list_profiles",
             lambda: [SimpleNamespace(path=profile_home)],
         )
-        monkeypatch.setattr(
-            "plugins.platforms.photon.auth.load_project_credentials",
-            lambda: (None, None),
-        )
 
         assert hm._photon_configured() is True
 
@@ -262,6 +258,13 @@ class TestCmdUpdateNpmLockfileCache:
         (profile_home / "gateway.json").write_text(
             '{"platforms":{"photon":{"extra":'
             '{"project_id":"test-id","project_secret":"test-secret"}}}}'
+        )
+        assert hm._photon_configured() is True
+
+        (profile_home / "gateway.json").unlink()
+        (profile_home / "auth.json").write_text(
+            '{"credential_pool":{"photon_project":[{'
+            '"spectrum_project_id":"test-id","project_secret":"test-secret"}]}}'
         )
         assert hm._photon_configured() is True
 
