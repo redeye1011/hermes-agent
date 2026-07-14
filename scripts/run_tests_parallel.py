@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -251,7 +253,8 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    test_home = tempfile.mkdtemp(prefix="hermes-test-home-")
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -260,7 +263,7 @@ def _run_one_file(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=os.environ,
+        env={**os.environ, "HERMES_HOME": test_home},
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -304,6 +307,8 @@ def _run_one_file(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+    finally:
+        shutil.rmtree(test_home, ignore_errors=True)
 
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
