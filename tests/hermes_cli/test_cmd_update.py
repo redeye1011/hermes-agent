@@ -207,6 +207,28 @@ class TestCmdUpdateNpmLockfileCache:
         (tmp_path / "apps" / "newtool" / "package.json").write_text("{}")
         assert hm._npm_lockfile_changed(tmp_path) is True
 
+    def test_photon_sidecar_state_defeats_skip(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+        sidecar.mkdir(parents=True)
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "node_modules").mkdir()
+        (sidecar / "package-lock.json").write_text("{}")
+        (sidecar / "package.json").write_text("{}")
+        (sidecar / "node_modules").mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        hm._record_npm_lockfile_hash(tmp_path)
+        assert hm._npm_lockfile_changed(tmp_path) is False
+        (sidecar / "package-lock.json").write_text('{"changed": true}')
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        hm._record_npm_lockfile_hash(tmp_path)
+        (sidecar / "node_modules").rmdir()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
     def test_npm_lockfile_changed_cache_read_error(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
 
@@ -1193,8 +1215,11 @@ def test_update_node_dependencies_fails_when_configured_photon_sidecar_sync_fail
         return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
 
     monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+    recorded = []
+    monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
 
     assert hm._update_node_dependencies() is False
+    assert recorded == []
 
 
 def test_zip_update_configured_sidecar_failure_suppresses_windows_gateway_resume(tmp_path, monkeypatch):

@@ -8140,7 +8140,9 @@ def _npm_manifest_paths() -> tuple[Path, ...]:
 
     The workspace list is pulled from the root package.json's `workspaces`
     globs (npm's own source of truth) rather than hardcoded, so adding a
-    workspace can never silently escape the skip key. The root install
+    workspace can never silently escape the skip key. Photon owns a separate
+    lockfile outside those workspaces, so its manifests are included too. The
+    root install
     (step 1, --workspaces=false) still hoists shared deps for EVERY
     workspace — desktop included — so all of them belong in the key, not
     just the ones step 2 installs. Falls back to hashing just root
@@ -8162,6 +8164,12 @@ def _npm_manifest_paths() -> tuple[Path, ...]:
                     paths.append(manifest)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    paths.extend(
+        path
+        for path in (photon_sidecar / "package-lock.json", photon_sidecar / "package.json")
+        if path.is_file()
+    )
     return tuple(paths)
 
 
@@ -8189,6 +8197,11 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     # Also check that node_modules exists; a matching hash with missing
     # node_modules means the cache was recorded by another checkout.
     if not (PROJECT_ROOT / "node_modules").is_dir():
+        return True
+    photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    if (photon_sidecar / "package.json").is_file() and not (
+        photon_sidecar / "node_modules"
+    ).is_dir():
         return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
@@ -8291,7 +8304,6 @@ def _update_node_dependencies() -> bool:
         env=nixos_env,
     )
     if ws_result.returncode == 0:
-        _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
     else:
         print("  ⚠ npm workspace install failed")
@@ -8303,6 +8315,7 @@ def _update_node_dependencies() -> bool:
     # package-lock.json for Spectrum and ffmpeg-static. Refresh it explicitly
     # so a normal Hermes update cannot leave code and native voice dependencies
     # at different revisions.
+    sidecar_ok = True
     if (photon_sidecar_dir / "package.json").exists():
         sidecar_result = _run_npm_install_deterministic(
             npm,
@@ -8314,12 +8327,20 @@ def _update_node_dependencies() -> bool:
         if sidecar_result.returncode == 0:
             print("  ✓ Photon sidecar dependencies")
         else:
+            sidecar_ok = False
             print("  ⚠ Photon sidecar dependency install failed")
             stderr = (sidecar_result.stderr or "").strip() if sidecar_result.stderr else ""
             if stderr:
                 print(f"    {stderr.splitlines()[-1]}")
             if photon_configured:
                 return False
+
+    if (
+        root_result.returncode == 0
+        and ws_result.returncode == 0
+        and sidecar_ok
+    ):
+        _record_npm_lockfile_hash(shared_hermes_root)
 
     return True
 
