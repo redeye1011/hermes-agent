@@ -4838,34 +4838,31 @@ def _run_npm_install_deterministic(
     # install path and nix/lib.nix npm ci hooks.
     run_env = {**os.environ, **(env or {}), "CI": "1"}
 
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=run_env,
+                capture_output=capture_output,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
+
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
         ci_cmd = [npm, "ci", *extra_args]
-        ci_result = subprocess.run(
-            ci_cmd,
-            cwd=cwd,
-            env=run_env,
-            capture_output=capture_output,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        ci_result = _run(ci_cmd)
         if ci_result.returncode == 0:
             return ci_result
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
     install_cmd = [npm, "install", *extra_args]
-    return subprocess.run(
-        install_cmd,
-        cwd=cwd,
-        env=run_env,
-        capture_output=capture_output,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    return _run(install_cmd)
 
 
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
@@ -6452,6 +6449,20 @@ def _update_via_zip(args):
     except Exception as e:
         logger.debug("Curator recent-run notice failed: %s", e)
     _kill_stale_dashboard_processes()
+
+
+def _run_update_via_zip(args, windows_gateway_resume: dict | None) -> None:
+    """Run the ZIP updater without reviving gateways after a failed update."""
+    try:
+        _update_via_zip(args)
+    except BaseException:
+        _suppress_windows_gateway_resume(windows_gateway_resume)
+        raise
+    _resume_windows_gateways_after_update(windows_gateway_resume)
+    if windows_gateway_resume:
+        import atexit
+
+        atexit.unregister(_resume_windows_gateways_after_update)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -8199,10 +8210,15 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     if not (PROJECT_ROOT / "node_modules").is_dir():
         return True
     photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
-    if (photon_sidecar / "package.json").is_file() and not (
-        photon_sidecar / "node_modules"
-    ).is_dir():
-        return True
+    if (photon_sidecar / "package.json").is_file():
+        sidecar_modules = photon_sidecar / "node_modules"
+        required = (
+            sidecar_modules / ".package-lock.json",
+            sidecar_modules / "spectrum-ts" / "package.json",
+            sidecar_modules / "ffmpeg-static" / "package.json",
+        )
+        if not all(path.is_file() for path in required):
+            return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
         cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
@@ -8226,19 +8242,65 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
         logger.debug("Could not write npm lockfile hash cache")
 
 
+def _photon_configured() -> bool:
+    """Return whether any Hermes profile has usable Photon credentials."""
+    from agent.secret_scope import build_profile_secret_scope
+    from hermes_cli.config import load_config
+    from hermes_cli.profiles import list_profiles
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from plugins.platforms.photon.auth import load_project_credentials
+
+    homes = [Path(get_hermes_home())]
+    try:
+        homes.extend(profile.path for profile in list_profiles())
+    except Exception:
+        pass
+
+    for home in dict.fromkeys(homes):
+        secrets = build_profile_secret_scope(home)
+        if secrets.get("PHOTON_PROJECT_ID") and secrets.get("PHOTON_PROJECT_SECRET"):
+            return True
+
+        token = set_hermes_home_override(str(home))
+        try:
+            project_id, project_secret = load_project_credentials()
+            config = load_config()
+        except Exception:
+            return True
+        finally:
+            reset_hermes_home_override(token)
+        if project_id and project_secret:
+            return True
+        extra = (
+            (((config.get("gateway") or {}).get("platforms") or {}).get("photon") or {}).get("extra")
+            or {}
+        )
+        if (
+            isinstance(extra, dict)
+            and extra.get("project_id")
+            and extra.get("project_secret")
+        ):
+            return True
+    return False
+
+
 def _update_node_dependencies() -> bool:
     """Refresh Node dependencies and report whether Photon is safe to restart."""
     from hermes_constants import find_node_executable, with_hermes_node_path
 
     npm = find_node_executable("npm")
     photon_sidecar_dir = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
-    # A source checkout can include the plugin without the user configuring
-    # Photon. Only enforce sidecar readiness when the platform is active.
     try:
-        from hermes_cli.config import get_env_value
-        photon_configured = bool(get_env_value("PHOTON_PROJECT_ID"))
+        photon_configured = _photon_configured()
     except Exception:
-        photon_configured = bool(os.environ.get("PHOTON_PROJECT_ID"))
+        photon_configured = bool(
+            os.environ.get("PHOTON_PROJECT_ID")
+            and os.environ.get("PHOTON_PROJECT_SECRET")
+        )
     if not npm:
         if photon_configured and (photon_sidecar_dir / "package.json").exists():
             print("  ⚠ Photon sidecar dependencies could not be checked: npm is unavailable")
@@ -9742,16 +9804,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken. A failed update must
         # not revive the paused gateway against stale code or dependencies.
-        try:
-            _update_via_zip(args)
-        except BaseException:
-            _suppress_windows_gateway_resume(_windows_gateway_resume)
-            raise
-        else:
-            _resume_windows_gateways_after_update(_windows_gateway_resume)
-            if _windows_gateway_resume:
-                import atexit as _atexit
-                _atexit.unregister(_resume_windows_gateways_after_update)
+        _run_update_via_zip(args, _windows_gateway_resume)
         return
 
     # Fetch and pull
@@ -10329,7 +10382,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print()
             print("✗ Update stopped: Photon sidecar dependencies are not ready.")
             print("  The gateway was not restarted. Fix npm/the sidecar install, then rerun `hermes update`.")
-            return
+            sys.exit(1)
         _build_web_ui(PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
@@ -11400,7 +11453,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _run_update_via_zip(args, _windows_gateway_resume)
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)

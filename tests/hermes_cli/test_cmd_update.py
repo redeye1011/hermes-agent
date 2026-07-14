@@ -38,16 +38,7 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 @pytest.fixture
 def mock_args(monkeypatch):
     """Use an unconfigured Photon environment for generic updater tests."""
-    import hermes_cli.config as config
-
-    original_get_env_value = config.get_env_value
-
-    def get_env_value_without_photon(name, *args, **kwargs):
-        if name == "PHOTON_PROJECT_ID":
-            return None
-        return original_get_env_value(name, *args, **kwargs)
-
-    monkeypatch.setattr(config, "get_env_value", get_env_value_without_photon)
+    monkeypatch.setattr("hermes_cli.main._photon_configured", lambda: False)
     return SimpleNamespace()
 
 
@@ -217,7 +208,12 @@ class TestCmdUpdateNpmLockfileCache:
         (tmp_path / "node_modules").mkdir()
         (sidecar / "package-lock.json").write_text("{}")
         (sidecar / "package.json").write_text("{}")
-        (sidecar / "node_modules").mkdir()
+        modules = sidecar / "node_modules"
+        (modules / "spectrum-ts").mkdir(parents=True)
+        (modules / "ffmpeg-static").mkdir()
+        (modules / ".package-lock.json").write_text("{}")
+        (modules / "spectrum-ts" / "package.json").write_text("{}")
+        (modules / "ffmpeg-static" / "package.json").write_text("{}")
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
         hm._record_npm_lockfile_hash(tmp_path)
@@ -226,8 +222,34 @@ class TestCmdUpdateNpmLockfileCache:
         assert hm._npm_lockfile_changed(tmp_path) is True
 
         hm._record_npm_lockfile_hash(tmp_path)
-        (sidecar / "node_modules").rmdir()
+        (modules / "spectrum-ts" / "package.json").unlink()
         assert hm._npm_lockfile_changed(tmp_path) is True
+
+    def test_photon_configured_in_named_profile(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        default_home = tmp_path / ".hermes"
+        profile_home = default_home / "profiles" / "work"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    photon:\n"
+            "      extra:\n"
+            "        project_id: test-id\n"
+            "        project_secret: test-secret\n"
+        )
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: default_home)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.list_profiles",
+            lambda: [SimpleNamespace(path=profile_home)],
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.photon.auth.load_project_credentials",
+            lambda: (None, None),
+        )
+
+        assert hm._photon_configured() is True
 
     def test_npm_lockfile_changed_cache_read_error(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
@@ -1116,9 +1138,11 @@ def test_cmd_update_does_not_continue_when_photon_sidecar_sync_fails(
     with patch.object(hm, "_update_node_dependencies", return_value=False), patch.object(
         hm, "_build_web_ui"
     ) as build_web:
-        cmd_update(mock_args)
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
 
     build_web.assert_not_called()
+    assert exc_info.value.code == 1
     out = capsys.readouterr().out
     assert "Photon sidecar dependencies are not ready" in out
     assert "gateway was not restarted" in out
@@ -1148,6 +1172,22 @@ def test_update_node_dependencies_installs_photon_sidecar(tmp_path, monkeypatch)
     hm._update_node_dependencies()
 
     assert any(cwd == sidecar_dir for _npm, cwd, _kwargs in installs)
+
+
+def test_npm_spawn_error_returns_failure(tmp_path, monkeypatch):
+    from hermes_cli import main as hm
+
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    def spawn_error(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "run", spawn_error)
+
+    result = hm._run_npm_install_deterministic("npm", tmp_path)
+
+    assert result.returncode != 0
+    assert "spawn failed" in result.stderr
 
 
 def test_update_node_dependencies_continues_to_photon_after_root_failure(tmp_path, monkeypatch):
@@ -1190,7 +1230,7 @@ def test_update_node_dependencies_ignores_sidecar_sync_failure_when_photon_uncon
         return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
 
     monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
-    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda name: None)
+    monkeypatch.setattr(hm, "_photon_configured", lambda: False)
 
     assert hm._update_node_dependencies() is True
 
@@ -1206,10 +1246,7 @@ def test_update_node_dependencies_fails_when_configured_photon_sidecar_sync_fail
     monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
     monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
-    monkeypatch.setattr(
-        "hermes_cli.config.get_env_value",
-        lambda name: "configured-project" if name == "PHOTON_PROJECT_ID" else None,
-    )
+    monkeypatch.setattr(hm, "_photon_configured", lambda: True)
 
     def fake_install(npm, cwd, **kwargs):
         return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
@@ -1277,8 +1314,10 @@ def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path,
     monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
     monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
 
-    hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+    with pytest.raises(SystemExit) as exc_info:
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
 
+    assert exc_info.value.code == 1
     assert registered
     assert unregistered == [hm._resume_windows_gateways_after_update]
     assert token["resume_needed"] is False
