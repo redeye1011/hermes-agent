@@ -8212,12 +8212,16 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
     if (photon_sidecar / "package.json").is_file():
         sidecar_modules = photon_sidecar / "node_modules"
+        ffmpeg_binary = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
         required = (
             sidecar_modules / ".package-lock.json",
-            sidecar_modules / "spectrum-ts" / "package.json",
-            sidecar_modules / "ffmpeg-static" / "package.json",
+            sidecar_modules / "spectrum-ts" / "dist" / "index.js",
+            sidecar_modules / "ffmpeg-static" / "index.js",
+            sidecar_modules / "ffmpeg-static" / ffmpeg_binary,
         )
         if not all(path.is_file() for path in required):
+            return True
+        if sys.platform != "win32" and not os.access(required[-1], os.X_OK):
             return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
@@ -8245,20 +8249,20 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
 def _photon_configured() -> bool:
     """Return whether any Hermes profile has usable Photon credentials."""
     from agent.secret_scope import build_profile_secret_scope
-    from hermes_cli.config import load_config
+    from gateway.config import Platform, load_gateway_config
     from hermes_cli.profiles import list_profiles
     from hermes_constants import (
         get_hermes_home,
         reset_hermes_home_override,
         set_hermes_home_override,
     )
-    from plugins.platforms.photon.auth import load_project_credentials
+    from plugins.platforms.photon.adapter import validate_config
 
     homes = [Path(get_hermes_home())]
     try:
         homes.extend(profile.path for profile in list_profiles())
     except Exception:
-        pass
+        return True
 
     for home in dict.fromkeys(homes):
         secrets = build_profile_secret_scope(home)
@@ -8267,24 +8271,13 @@ def _photon_configured() -> bool:
 
         token = set_hermes_home_override(str(home))
         try:
-            project_id, project_secret = load_project_credentials()
-            config = load_config()
+            photon = load_gateway_config().platforms.get(Platform("photon"))
+            if photon and validate_config(photon):
+                return True
         except Exception:
             return True
         finally:
             reset_hermes_home_override(token)
-        if project_id and project_secret:
-            return True
-        extra = (
-            (((config.get("gateway") or {}).get("platforms") or {}).get("photon") or {}).get("extra")
-            or {}
-        )
-        if (
-            isinstance(extra, dict)
-            and extra.get("project_id")
-            and extra.get("project_secret")
-        ):
-            return True
     return False
 
 

@@ -209,11 +209,17 @@ class TestCmdUpdateNpmLockfileCache:
         (sidecar / "package-lock.json").write_text("{}")
         (sidecar / "package.json").write_text("{}")
         modules = sidecar / "node_modules"
-        (modules / "spectrum-ts").mkdir(parents=True)
+        (modules / "spectrum-ts" / "dist").mkdir(parents=True)
         (modules / "ffmpeg-static").mkdir()
         (modules / ".package-lock.json").write_text("{}")
-        (modules / "spectrum-ts" / "package.json").write_text("{}")
-        (modules / "ffmpeg-static" / "package.json").write_text("{}")
+        (modules / "spectrum-ts" / "dist" / "index.js").write_text("")
+        (modules / "ffmpeg-static" / "index.js").write_text("")
+        ffmpeg = modules / "ffmpeg-static" / (
+            "ffmpeg.exe" if hm.sys.platform == "win32" else "ffmpeg"
+        )
+        ffmpeg.write_text("")
+        if hm.sys.platform != "win32":
+            ffmpeg.chmod(0o755)
         monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
 
         hm._record_npm_lockfile_hash(tmp_path)
@@ -222,7 +228,7 @@ class TestCmdUpdateNpmLockfileCache:
         assert hm._npm_lockfile_changed(tmp_path) is True
 
         hm._record_npm_lockfile_hash(tmp_path)
-        (modules / "spectrum-ts" / "package.json").unlink()
+        (modules / "spectrum-ts" / "dist" / "index.js").unlink()
         assert hm._npm_lockfile_changed(tmp_path) is True
 
     def test_photon_configured_in_named_profile(self, tmp_path, monkeypatch):
@@ -232,13 +238,14 @@ class TestCmdUpdateNpmLockfileCache:
         profile_home = default_home / "profiles" / "work"
         profile_home.mkdir(parents=True)
         (profile_home / "config.yaml").write_text(
-            "gateway:\n"
-            "  platforms:\n"
-            "    photon:\n"
-            "      extra:\n"
-            "        project_id: test-id\n"
-            "        project_secret: test-secret\n"
+            "platforms:\n"
+            "  photon:\n"
+            "    extra:\n"
+            "      project_id: test-id\n"
+            "      project_secret: test-secret\n"
         )
+        monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
+        monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: default_home)
         monkeypatch.setattr(
             "hermes_cli.profiles.list_profiles",
@@ -249,6 +256,24 @@ class TestCmdUpdateNpmLockfileCache:
             lambda: (None, None),
         )
 
+        assert hm._photon_configured() is True
+
+        (profile_home / "config.yaml").unlink()
+        (profile_home / "gateway.json").write_text(
+            '{"platforms":{"photon":{"extra":'
+            '{"project_id":"test-id","project_secret":"test-secret"}}}}'
+        )
+        assert hm._photon_configured() is True
+
+    def test_photon_profile_enumeration_failure_is_conservative(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        def fail_profiles():
+            raise OSError("profile scan failed")
+
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", fail_profiles)
         assert hm._photon_configured() is True
 
     def test_npm_lockfile_changed_cache_read_error(self, tmp_path, monkeypatch):
