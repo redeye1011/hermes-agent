@@ -228,8 +228,18 @@ class TestCmdUpdateNpmLockfileCache:
         assert hm._npm_lockfile_changed(tmp_path) is True
 
         hm._record_npm_lockfile_hash(tmp_path)
-        (modules / "spectrum-ts" / "dist" / "index.js").unlink()
+        spectrum_entry = modules / "spectrum-ts" / "dist" / "index.js"
+        spectrum_entry.unlink()
         assert hm._npm_lockfile_changed(tmp_path) is True
+
+        spectrum_entry.write_text("")
+        ffmpeg.unlink()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        if hm.sys.platform != "win32":
+            ffmpeg.write_text("")
+            ffmpeg.chmod(0o644)
+            assert hm._npm_lockfile_changed(tmp_path) is True
 
     def test_photon_configured_in_named_profile(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
