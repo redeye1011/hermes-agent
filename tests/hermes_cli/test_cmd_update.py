@@ -1359,3 +1359,36 @@ def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path,
     assert registered
     assert unregistered == [hm._resume_windows_gateways_after_update]
     assert token["resume_needed"] is False
+
+
+def test_windows_update_exception_suppresses_gateway_resume(tmp_path, monkeypatch):
+    """Unexpected update failures must leave the paused gateway down."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm.subprocess, "run", _make_run_side_effect(commit_count="1"))
+
+    def interrupted_update():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hm, "_update_node_dependencies", interrupted_update)
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(KeyboardInterrupt):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False

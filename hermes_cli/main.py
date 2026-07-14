@@ -9486,12 +9486,12 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
 
 def _suppress_windows_gateway_resume(token: dict | None) -> None:
     """Keep paused Windows gateways down after an unsafe update failure."""
-    if not token:
+    if not token or not token.get("resume_needed"):
         return
     token["resume_needed"] = False
     import atexit
-    atexit.unregister(_resume_windows_gateways_after_update)
 
+    atexit.unregister(_resume_windows_gateways_after_update)
 
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
@@ -11454,6 +11454,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+    except BaseException:
+        _suppress_windows_gateway_resume(_windows_gateway_resume)
+        raise
 
 
 def _coalesce_session_name_args(argv: list) -> list:
