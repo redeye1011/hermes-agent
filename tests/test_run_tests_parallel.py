@@ -242,9 +242,11 @@ def test_runner_isolates_hermes_runtime_env(tmp_path: Path, monkeypatch) -> None
         "    assert os.environ['HERMES_HOME'] != 'parent-home'\n"
         "    assert os.environ['HOME'] == os.environ['HERMES_HOME']\n"
         "    assert 'HERMES_SESSION_KEY' not in os.environ\n"
+        "    assert os.environ['HERMES_RUN_SLOW_PET_TESTS'] == '1'\n"
     )
     monkeypatch.setenv("HERMES_HOME", "parent-home")
     monkeypatch.setenv("HERMES_SESSION_KEY", "parent-session")
+    monkeypatch.setenv("HERMES_RUN_SLOW_PET_TESTS", "1")
 
     proc = _run_runner(probe_dir)
     assert proc.returncode == 0, proc.stdout

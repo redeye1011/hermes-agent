@@ -288,6 +288,26 @@ class TestCmdUpdateNpmLockfileCache:
         monkeypatch.setattr("hermes_cli.profiles.list_profiles", fail_profiles)
         assert hm._photon_configured() is True
 
+    @pytest.mark.parametrize(
+        ("relative_path", "contents"),
+        [
+            (".env", b"\xff\xfe"),
+            ("auth.json", b"{"),
+            ("gateway.json", b"{"),
+            ("config.yaml", b"platforms: ["),
+        ],
+    )
+    def test_photon_configuration_read_failure_is_conservative(
+        self, tmp_path, monkeypatch, relative_path, contents
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / relative_path).write_bytes(contents)
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+
+        assert hm._photon_configured() is True
+
     def test_npm_lockfile_changed_cache_read_error(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
 
@@ -484,10 +504,18 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_already_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, capsys, monkeypatch
     ):
+        from hermes_cli import main as hm
+
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
+        )
+        dependency_updates = []
+        monkeypatch.setattr(
+            hm,
+            "_update_node_dependencies",
+            lambda: dependency_updates.append(True) or True,
         )
 
         cmd_update(mock_args)
@@ -499,6 +527,38 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 0
+        assert dependency_updates == [True]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_current_checkout_stops_when_node_repair_fails(
+        self, mock_run, _mock_which, mock_args, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+        suppressed = []
+        resumed = []
+        monkeypatch.setattr(hm, "_update_node_dependencies", lambda: False)
+        monkeypatch.setattr(
+            hm,
+            "_suppress_windows_gateway_resume",
+            lambda state: suppressed.append(state),
+        )
+        monkeypatch.setattr(
+            hm,
+            "_resume_windows_gateways_after_update",
+            lambda state: resumed.append(state),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
+
+        assert exc_info.value.code == 1
+        assert suppressed
+        assert resumed == []
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
