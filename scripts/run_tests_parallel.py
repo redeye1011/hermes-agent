@@ -254,6 +254,11 @@ def _run_one_file(
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     test_home = tempfile.mkdtemp(prefix="hermes-test-home-")
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    child_env["HERMES_HOME"] = test_home
+    child_env["HOME"] = test_home
+    if sys.platform == "win32":
+        child_env["USERPROFILE"] = test_home
 
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -263,7 +268,7 @@ def _run_one_file(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env={**os.environ, "HERMES_HOME": test_home},
+        env=child_env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

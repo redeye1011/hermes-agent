@@ -1666,6 +1666,7 @@ def test_create_task_probe_error_does_not_break_create(client, monkeypatch):
 @pytest.fixture
 def with_home_channels(monkeypatch):
     """Simulate a user with home channels set on telegram and discord."""
+    monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "abc:fake")
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "1234567")
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL_THREAD_ID", "42")

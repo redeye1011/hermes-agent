@@ -597,6 +597,7 @@ class TestLocalDeliveryNotice:
             "HERMES_SESSION_CHAT_NAME",
         ):
             monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
         from gateway.session_context import clear_session_vars, set_session_vars
 
         tokens = set_session_vars()  # reset ContextVars to empty

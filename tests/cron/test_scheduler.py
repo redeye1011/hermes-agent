@@ -516,6 +516,8 @@ class TestRoutingIntents:
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
                     "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
+        # Keep lazy plugin discovery from reloading the user's Photon home.
+        monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
 
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
@@ -546,6 +548,7 @@ class TestRoutingIntents:
 
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
 
         for token in ("ALL", "All", "all"):
             targets = _resolve_delivery_targets({"deliver": token, "origin": None})
