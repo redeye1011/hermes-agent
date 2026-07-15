@@ -8258,6 +8258,7 @@ def _photon_configured() -> bool:
     )
     from plugins.platforms.photon.adapter import validate_config
     from plugins.platforms.photon.auth import load_project_credentials
+    import yaml
 
     homes = [Path(get_hermes_home())]
     try:
@@ -8266,6 +8267,24 @@ def _photon_configured() -> bool:
         return True
 
     for home in dict.fromkeys(homes):
+        # The runtime loaders intentionally fail open for ordinary startup, but
+        # the updater cannot interpret an unreadable/corrupt source as "Photon
+        # is unconfigured": doing so would make a failed sidecar install
+        # non-fatal and allow a gateway restart with stale dependencies.
+        try:
+            env_path = home / ".env"
+            if env_path.exists():
+                env_path.read_text(encoding="utf-8")
+            for filename in ("auth.json", "gateway.json"):
+                path = home / filename
+                if path.exists():
+                    json.loads(path.read_text(encoding="utf-8"))
+            config_path = home / "config.yaml"
+            if config_path.exists():
+                yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError):
+            return True
+
         secrets = build_profile_secret_scope(home)
         if secrets.get("PHOTON_PROJECT_ID") and secrets.get("PHOTON_PROJECT_SECRET"):
             return True
@@ -10011,7 +10030,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
+            if not _update_node_dependencies():
+                _suppress_windows_gateway_resume(_windows_gateway_resume)
+                print()
+                print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+                print("  The gateway was not restarted. Fix npm/the sidecar install, then rerun `hermes update`.")
+                sys.exit(1)
+            if healthy:
                 print("✓ Already up to date!")
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return

@@ -254,7 +254,11 @@ def _run_one_file(
     """
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     test_home = tempfile.mkdtemp(prefix="hermes-test-home-")
-    child_env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    child_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("HERMES_") or k == "HERMES_RUN_SLOW_PET_TESTS"
+    }
     child_env["HERMES_HOME"] = test_home
     child_env["HOME"] = test_home
     if sys.platform == "win32":
