@@ -175,6 +175,11 @@ def test_photon_sidecar_runtime_ships_and_ffmpeg_is_optional():
     assert package["optionalDependencies"]["ffmpeg-static"] == "5.2.0"
     assert "ffmpeg-static" not in package["dependencies"]
 
+    osv_workflow = (REPO_ROOT / ".github/workflows/osv-scanner.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "--lockfile=plugins/platforms/photon/sidecar/package-lock.json" in osv_workflow
+
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
