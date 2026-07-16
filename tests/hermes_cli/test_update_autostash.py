@@ -524,16 +524,25 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
 
 # ---------------------------------------------------------------------------
-# ff-only fallback to reset --hard on diverged history
+# ff-only fallback on diverged history
 # ---------------------------------------------------------------------------
 
 def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
+    commit_count_returncode=0,
+    local_commit_count="0",
+    local_commit_returncode=0,
     ff_only_fails=False,
     reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
+    push_remote="",
+    push_fails=False,
+    mirror_fails=False,
+    rebase_fails=False,
+    abort_fails=False,
+    head_sha="abc123def456",
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
@@ -547,10 +556,28 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "HEAD" in joined:
+            return SimpleNamespace(stdout=f"{head_sha}\n", stderr="", returncode=0)
+        if "config" in joined and "pushRemote" in joined:
+            return SimpleNamespace(
+                stdout=f"{push_remote}\n" if push_remote else "",
+                stderr="",
+                returncode=0 if push_remote else 1,
+            )
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-list" in joined and "origin/main..HEAD" in joined:
+            return SimpleNamespace(
+                stdout=f"{local_commit_count}\n",
+                stderr="local probe failed\n" if local_commit_returncode else "",
+                returncode=local_commit_returncode,
+            )
         if "rev-list" in joined:
-            return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
+            return SimpleNamespace(
+                stdout=f"{commit_count}\n",
+                stderr="update probe failed\n" if commit_count_returncode else "",
+                returncode=commit_count_returncode,
+            )
         if "--ff-only" in joined:
             if ff_only_fails:
                 return SimpleNamespace(
@@ -559,6 +586,24 @@ def _make_update_side_effect(
                     returncode=128,
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
+        if "push" in joined:
+            if "--force-with-lease" in joined and mirror_fails:
+                return SimpleNamespace(stdout="", stderr="lease rejected\n", returncode=1)
+            if push_fails:
+                return SimpleNamespace(stdout="", stderr="push failed\n", returncode=1)
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rebase" in joined:
+            if "--abort" in joined:
+                return SimpleNamespace(
+                    stdout="",
+                    stderr="abort failed\n" if abort_fails else "",
+                    returncode=1 if abort_fails else 0,
+                )
+            return SimpleNamespace(
+                stdout="",
+                stderr="conflict\n" if rebase_fails else "",
+                returncode=1 if rebase_fails else 0,
+            )
         if "reset" in joined and "--hard" in joined:
             if reset_fails:
                 return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
@@ -569,7 +614,7 @@ def _make_update_side_effect(
 
 
 def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+    """When no local commits exist, a rewritten remote can be reset safely."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -584,6 +629,468 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
+
+
+def test_cmd_update_noop_checks_out_original_branch_before_restoring_stash(
+    monkeypatch, tmp_path
+):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    order = []
+    side_effect, _ = _make_update_side_effect(
+        current_branch="fix/local", commit_count="0"
+    )
+
+    def recording_run(cmd, **kwargs):
+        if cmd == ["git", "checkout", "fix/local"]:
+            order.append("checkout")
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", recording_run)
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: order.append("stash") or True,
+    )
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert order[:2] == ["checkout", "stash"]
+
+
+def test_cmd_update_success_keeps_target_checkout_and_preserves_foreign_stash(
+    monkeypatch, tmp_path, capsys
+):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    restored = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local", commit_count="3"
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "checkout", "main"] in recorded
+    assert ["git", "checkout", "fix/local"] not in recorded
+    assert restored == []
+    assert "Local changes preserved in stash" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("commit_count", "returncode"),
+    [("not-a-number", 0), ("3", 128)],
+)
+def test_cmd_update_restores_branch_and_stash_when_update_probe_fails(
+    monkeypatch, tmp_path, capsys, commit_count, returncode
+):
+    """The initial rev-list probe is safe even after checkout + auto-stash."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    restored = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local",
+        commit_count=commit_count,
+        commit_count_returncode=returncode,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    checkout_calls = [cmd for cmd in recorded if "checkout" in cmd]
+    assert ["git", "checkout", "main"] in checkout_calls
+    assert ["git", "checkout", "fix/local"] in checkout_calls
+    assert restored == [1]
+    assert "Could not determine updates" in capsys.readouterr().out
+
+
+def test_cmd_update_restores_checkout_when_update_probe_raises(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    restored = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(current_branch="fix/local")
+
+    def interrupted_probe(cmd, **kwargs):
+        if "rev-list" in cmd and any("HEAD..origin/" in str(arg) for arg in cmd):
+            raise KeyboardInterrupt
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", interrupted_probe)
+
+    with pytest.raises(KeyboardInterrupt):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "checkout", "fix/local"] in recorded
+    assert restored == [1]
+
+
+def test_cmd_update_restores_stash_when_checkout_spawn_fails(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    restored = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, _ = _make_update_side_effect(current_branch="fix/local")
+
+    def failed_checkout_spawn(cmd, **kwargs):
+        if cmd == ["git", "checkout", "main"]:
+            raise OSError("git unavailable")
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", failed_checkout_spawn)
+
+    with pytest.raises(OSError, match="git unavailable"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert restored == [1]
+
+
+def test_cmd_update_restores_checkout_when_pull_spawn_fails(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    restored = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local", commit_count="1"
+    )
+
+    def failed_pull_spawn(cmd, **kwargs):
+        if "pull" in cmd:
+            raise OSError("git unavailable")
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", failed_pull_spawn)
+
+    with pytest.raises(OSError, match="git unavailable"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "checkout", "fix/local"] in recorded
+    assert restored == [1]
+
+
+def test_cmd_update_restores_detached_head_when_update_probe_fails(
+    monkeypatch, tmp_path
+):
+    """A safe failure must return to the exact detached commit, not main."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    restored = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="HEAD",
+        commit_count="not-a-number",
+        head_sha="detached123",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    checkout_calls = [cmd for cmd in recorded if "checkout" in cmd]
+    assert ["git", "checkout", "main"] in checkout_calls
+    assert ["git", "checkout", "detached123"] in checkout_calls
+    assert restored == [1]
+
+
+@pytest.mark.parametrize(
+    ("local_count", "returncode"),
+    [("not-a-number", 0), ("2", 128)],
+)
+def test_cmd_update_restores_branch_and_stash_when_local_ahead_probe_fails(
+    monkeypatch, tmp_path, local_count, returncode
+):
+    """A failed divergence probe must not strand the update branch or stash."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    restored = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local",
+        ff_only_fails=True,
+        local_commit_count=local_count,
+        local_commit_returncode=returncode,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    checkout_calls = [cmd for cmd in recorded if "checkout" in cmd]
+    assert ["git", "checkout", "main"] in checkout_calls
+    assert ["git", "checkout", "fix/local"] in checkout_calls
+    assert restored == [1]
+
+
+@pytest.mark.parametrize("failure_type", [OSError, KeyboardInterrupt])
+def test_cmd_update_restores_checkout_when_divergence_probe_spawn_fails(
+    monkeypatch, tmp_path, failure_type
+):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    restored = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restored.append(1) or True,
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="fix/local", commit_count="1", ff_only_fails=True
+    )
+
+    def failed_probe(cmd, **kwargs):
+        if "rev-list" in cmd and any("origin/main..HEAD" in str(arg) for arg in cmd):
+            raise failure_type("git unavailable")
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", failed_probe)
+
+    with pytest.raises(failure_type):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "checkout", "fix/local"] in recorded
+    assert restored == [1]
+
+
+def test_cmd_update_never_resets_committed_local_divergence(monkeypatch, tmp_path, capsys):
+    """Standard update must preserve committed local fixes when main advances."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restore_calls.append(1) or True,
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="23",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert not [cmd for cmd in recorded if "reset" in cmd and "--hard" in cmd]
+    assert restore_calls == [1]
+    assert "23 local commit" in capsys.readouterr().out
+
+
+def test_cmd_update_backs_up_and_rebases_committed_local_divergence(
+    monkeypatch, tmp_path, capsys
+):
+    """A configured pushRemote enables lossless backup + rebase updates."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="23",
+        push_remote="fork",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    push_calls = [cmd for cmd in recorded if "push" in cmd]
+    rebase_calls = [cmd for cmd in recorded if "rebase" in cmd]
+    assert push_calls == [
+        ["git", "push", "fork", "HEAD:refs/heads/main"],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/main:abc123def456",
+            "fork",
+            "HEAD:refs/heads/main",
+        ],
+    ]
+    assert rebase_calls == [["git", "rebase", "origin/main"]]
+    assert not [cmd for cmd in recorded if "reset" in cmd and "--hard" in cmd]
+    out = capsys.readouterr().out
+    assert "Backing up 23 local commit" in out
+    assert "rebased and mirrored to fork/main" in out
+
+
+def test_cmd_update_stops_before_rebase_when_backup_push_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A failed backup push must leave local commit history untouched."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    restore_calls = []
+    monkeypatch.setattr(
+        hermes_main, "_stash_local_changes_if_needed", lambda *a, **kw: "stash-sha"
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *a, **kw: restore_calls.append(1) or True,
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        push_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert not [cmd for cmd in recorded if "rebase" in cmd]
+    assert restore_calls == [1]
+    assert "stopped before rebase" in capsys.readouterr().out
+
+
+def test_cmd_update_aborts_conflicted_rebase_and_keeps_backup(
+    monkeypatch, tmp_path, capsys
+):
+    """A conflicted rebase is aborted after the backup push succeeds."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        rebase_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "rebase", "--abort"] in recorded
+    assert "Backup remains available on fork/main" in capsys.readouterr().out
+
+
+def test_cmd_update_reports_failed_rebase_abort(monkeypatch, tmp_path, capsys):
+    """Never claim restoration when git rebase --abort itself fails."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, _ = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        rebase_fails=True,
+        abort_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    out = capsys.readouterr().out
+    assert "automatic abort failed" in out
+    assert "original local history was restored" not in out
+
+
+def test_cmd_update_rolls_back_when_explicit_lease_rejects_mirror(
+    monkeypatch, tmp_path, capsys
+):
+    """A concurrent fork update must roll local HEAD back before exiting."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        mirror_fails=True,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "reset", "--hard", "abc123def456"] in recorded
+    assert "local rebase was rolled back" in capsys.readouterr().out
+
+
+def test_cmd_update_validates_syntax_before_mirroring_rebased_history(
+    monkeypatch, tmp_path
+):
+    """A bad upstream checkout must leave fork/main on its pre-rebase SHA."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_validate_critical_files_syntax",
+        lambda _root: (False, "hermes_cli/main.py", "bad syntax"),
+    )
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    push_calls = [cmd for cmd in recorded if "push" in cmd]
+    assert push_calls == [["git", "push", "fork", "HEAD:refs/heads/main"]]
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
