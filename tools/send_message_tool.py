@@ -726,13 +726,30 @@ async def _send_via_adapter(
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                if not result.success:
+                    return {"error": f"Adapter send failed: {result.error}"}
+                if media_files:
+                    from gateway.platforms.base import should_send_media_as_audio
+
+                    for media_path, is_voice in media_files:
+                        ext = os.path.splitext(media_path)[1].lower()
+                        if not force_document and should_send_media_as_audio(
+                            platform, ext, is_voice=is_voice
+                        ):
+                            media_result = await adapter.send_voice(
+                                chat_id=chat_id, audio_path=media_path, metadata=metadata
+                            )
+                        else:
+                            media_result = await adapter.send_document(
+                                chat_id=chat_id, file_path=media_path, metadata=metadata
+                            )
+                        if not media_result.success:
+                            return {"error": f"Adapter media send failed: {media_result.error}"}
+                return {"success": True, "message_id": result.message_id}
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
     try:
@@ -1025,6 +1042,26 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
+                force_document=force_document,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
+    # --- Photon/iMessage: native attachments via the Photon plugin's
+    # standalone sender. It reuses the live sidecar's /send-attachment route.
+    if platform.value == "photon" and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if is_last else None,
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
