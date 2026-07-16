@@ -1,6 +1,7 @@
 """Regression tests for Hermes' Spectrum mixed text+attachment workaround."""
 from __future__ import annotations
 
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -77,6 +78,10 @@ const asText = (text) => ({ type: "text", text });
 const asCustom = (message) => ({ type: "custom" });
 const asProviderGroup = (items) => ({ type: "group", items });
 const messageAttachments = (message) => message.content.attachments ?? [];
+const toMessageGuid = (value) => value;
+const ATTACHMENT_JOIN_RETRY_DELAY_MS = 0;
+const ATTACHMENT_JOIN_RETRY_LIMIT = 2;
+const setTimeout$1 = async () => {};
 const buildMessageBase = (message, chatGuidHint, timestamp, phone) => ({ direction: "inbound", sender: { id: "s" }, space: { id: "sp", type: "dm", phone }, timestamp });
 const buildAttachmentMessage = async (client, base, info, id, partIndex, parentId) => {
   const msg = { ...base, id, content: { type: "attachment", id: info.guid }, partIndex };
@@ -184,7 +189,7 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     assert "formatChildId(text2 ? i + 1 : i, messageGuidStr)" in patched
     # The text is captured in both mappers before the attachment branches run.
     assert "const text2 = message.content.text;" in patched
-    assert "const text2 = event.message.content.text;" in patched
+    assert "const text2 = sourceMessage.content.text;" in patched
 
     # Re-running is a no-op (idempotent self-heal on every sidecar start).
     again = subprocess.run(
@@ -196,6 +201,49 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     )
     assert again.returncode == 0, again.stderr
     assert chunk.read_text(encoding="utf-8") == patched
+
+
+def test_spectrum_patch_upgrades_legacy_placeholder_hydration(tmp_path: Path) -> None:
+    """A sidecar restart must migrate an already-patched 8.x mapper."""
+    chunk = _write_fixture(tmp_path)
+    first = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+
+    current = chunk.read_text(encoding="utf-8")
+    legacy, replacements = re.subn(
+        r"\t\tlet refreshError;\n\t\tlet confirmedPlaceholder = false;\n\t\tfor \(let attempt = 0;.*?\n\t\tif \(isPlaceholderOnly\(sourceMessage\)\) \{\n\t\t\tif \(refreshError && !confirmedPlaceholder\) throw refreshError;\n\t\t\treturn \[\];\n\t\t\}",
+        "\t\tfor (let attempt = 0; attempt < ATTACHMENT_JOIN_RETRY_LIMIT; attempt += 1) {\n\t\t\tawait setTimeout$1(ATTACHMENT_JOIN_RETRY_DELAY_MS);\n\t\t\ttry {\n\t\t\t\tconst refreshed = await client.messages.get(toMessageGuid(sourceMessage.guid));\n\t\t\t\tif (refreshed) sourceMessage = refreshed;\n\t\t\t} catch {}\n\t\t\tif (!isPlaceholderOnly(sourceMessage)) break;\n\t\t}\n\t\tif (isPlaceholderOnly(sourceMessage)) return [];",
+        current,
+        count=1,
+        flags=re.DOTALL,
+    )
+    assert replacements == 1
+    chunk.write_text(
+        legacy.replace(
+            "Hydrate placeholder-only iMessage attachments v2",
+            "Hydrate placeholder-only iMessage attachments",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    upgrade = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert upgrade.returncode == 0, upgrade.stderr
+    migrated = chunk.read_text(encoding="utf-8")
+    assert "Hydrate placeholder-only iMessage attachments v2" in migrated
+    assert "refreshError ??= error" in migrated
 
 
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
@@ -243,6 +291,28 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
         // Text only, no attachments -> plain text (unchanged).
         r = await rebuildFromAppleMessage(null, {{ guid: "G4", content: {{ text: "just text", attachments: [] }} }}, "+1");
         assert(r.content.type === "text" && r.content.text === "just text" && r.id === "G4", "text-only unchanged");
+
+        // A remote iMessage voice note can first arrive as Apple's U+FFFC
+        // placeholder. Re-fetching must hydrate its attachment before emission.
+        const placeholder = {{ guid: "G5", content: {{ text: "\uFFFC", attachments: [] }} }};
+        const hydrated = {{ guid: "G5", content: {{ text: "", attachments: [{{ guid: "A0" }}] }} }};
+        let refetches = 0;
+        arr = await toInboundMessages({{ messages: {{ get: async () => {{ refetches += 1; return hydrated; }} }} }}, new Map(), {{ message: placeholder }}, "+1");
+        assert(refetches === 1 && arr.length === 1 && arr[0].content.type === "attachment", "placeholder hydrates to attachment");
+
+        // A permanently incomplete placeholder is not an agent-visible text turn.
+        arr = await toInboundMessages({{ messages: {{ get: async () => placeholder }} }}, new Map(), {{ message: placeholder }}, "+1");
+        assert(arr.length === 0, "unhydrated placeholder suppressed");
+
+        // A transient lookup outage must escape to the sidecar stream recovery
+        // path rather than silently dropping a voice message.
+        let lookupFailed = false;
+        try {{
+          await toInboundMessages({{ messages: {{ get: async () => {{ throw new Error("temporary Photon lookup failure"); }} }} }}, new Map(), {{ message: placeholder }}, "+1");
+        }} catch {{
+          lookupFailed = true;
+        }}
+        assert(lookupFailed, "transient placeholder lookup is retried by stream recovery");
         """
     )
     run = subprocess.run(
