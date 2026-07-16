@@ -4241,6 +4241,15 @@ class BasePlatformAdapter(ABC):
                 logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
         return safe_paths
 
+    @staticmethod
+    def exclude_media_duplicate_local_paths(media_files, local_files) -> List[str]:
+        """Remove bare paths already queued by an explicit MEDIA directive."""
+        media_realpaths = {os.path.realpath(path) for path, _is_voice in media_files or []}
+        return [
+            path for path in local_files or []
+            if os.path.realpath(path) not in media_realpaths
+        ]
+
 
     @staticmethod
     def _mask_protected_spans(content: str) -> str:
@@ -5746,6 +5755,19 @@ class BasePlatformAdapter(ABC):
                     local_files = self.filter_local_delivery_paths(local_files)
                     if _history_media_paths:
                         local_files = [p for p in local_files if p not in _history_media_paths]
+                    if media_files and local_files:
+                        # A reply can contain a bare path as well as the MEDIA:
+                        # tag auto-appended from the same tool result.  Deliver
+                        # it once through the explicit MEDIA path.
+                        original_local_count = len(local_files)
+                        local_files = self.exclude_media_duplicate_local_paths(
+                            media_files, local_files
+                        )
+                        if len(local_files) != original_local_count:
+                            logger.debug(
+                                "[%s] suppressing %d local file(s) already queued via MEDIA",
+                                self.name, original_local_count - len(local_files),
+                            )
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
@@ -6062,7 +6084,13 @@ class BasePlatformAdapter(ABC):
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
-                        if ext in _VIDEO_EXTS:
+                        if should_send_media_as_audio(self.platform, ext):
+                            file_result = await self.send_voice(
+                                chat_id=event.source.chat_id,
+                                audio_path=file_path,
+                                metadata=_final_thread_metadata,
+                            )
+                        elif ext in _VIDEO_EXTS:
                             file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
