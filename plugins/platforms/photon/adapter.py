@@ -1228,11 +1228,21 @@ class PhotonAdapter(BasePlatformAdapter):
             is_voice = payload.get("type") == "voice"
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
             mime = payload.get("mimeType") or ""
+            is_native_imessage_voice = (
+                payload.get("type") == "attachment"
+                and name.lower() == "audio message.caf"
+                and mime.strip().lower() in {"", "application/octet-stream"}
+            )
+            if is_native_imessage_voice:
+                is_voice = True
+                mime = "audio/x-caf"
             # Promote CAF attachments to VOICE (iMessage voice notes use CAF).
             # Check both filename and MIME: the sidecar may send "(unnamed)"
             # when no name is supplied, so the MIME type is the reliable signal.
             if not is_voice and (name.lower().endswith(".caf") or mime == "audio/x-caf"):
                 is_voice = True
+            if is_voice and name == "(unnamed)":
+                name = "voice"
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
@@ -1591,6 +1601,34 @@ class PhotonAdapter(BasePlatformAdapter):
                 "reinstalling before start"
             )
             await asyncio.to_thread(_reinstall_sidecar_deps)
+        sidecar_dir = _sidecar_dir()
+        modules = sidecar_dir / "node_modules"
+        ffmpeg_binary = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        static_index = modules / "ffmpeg-static" / "index.js"
+        static_binary = modules / "ffmpeg-static" / ffmpeg_binary
+        required_runtime = (modules / "@spectrum-ts" / "imessage" / "dist" / "index.js",)
+
+        def _ffmpeg_path() -> str | None:
+            return str(static_binary) if static_index.exists() and static_binary.exists() else shutil.which("ffmpeg")
+
+        ffmpeg = _ffmpeg_path()
+        if not all(path.exists() for path in required_runtime) or not ffmpeg:
+            logger.warning("[photon] sidecar runtime is incomplete; reinstalling before start")
+            await asyncio.to_thread(_reinstall_sidecar_deps)
+            ffmpeg = _ffmpeg_path()
+        if not sidecar_deps_installed() or not all(path.exists() for path in required_runtime) or not ffmpeg:
+            raise RuntimeError(
+                f"Photon sidecar deps could not be installed into {sidecar_dir} "
+                f"(see log for the npm error). Run: cd {sidecar_dir} && npm ci"
+            )
+        try:
+            ffmpeg_probe = subprocess.run(  # noqa: S603
+                [ffmpeg, "-version"], capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("Photon ffmpeg runtime is unusable") from exc
+        if ffmpeg_probe.returncode != 0:
+            raise RuntimeError("Photon ffmpeg runtime is unusable")
         await self._reap_stale_sidecar()
 
         env = os.environ.copy()
@@ -1635,10 +1673,16 @@ class PhotonAdapter(BasePlatformAdapter):
             if patch.stderr.strip():
                 logger.debug("[photon] %s", patch.stderr.strip())
         except Exception as exc:
-            logger.warning(
-                "[photon] failed to apply Spectrum mixed attachment patch: %s",
-                exc,
+            raise RuntimeError(f"Photon Spectrum attachment patch failed: {exc}") from exc
+        patched = required_runtime[0].read_text(encoding="utf-8")
+        if not all(
+            marker in patched
+            for marker in (
+                "Hermes patch: Preserve mixed text + attachment iMessage payloads",
+                "Hermes patch: Hydrate placeholder-only iMessage attachments v2",
             )
+        ):
+            raise RuntimeError("Photon Spectrum attachment patch markers are missing")
 
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_sidecar_dir() / "index.mjs")],

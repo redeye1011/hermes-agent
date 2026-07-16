@@ -259,6 +259,37 @@ async def test_streamed_response_receives_prior_turn_media_paths(
         "history_media_paths"
     ] == {prior_path}
 
+@pytest.mark.asyncio
+async def test_streamed_photon_tts_sends_spoken_text_followup(monkeypatch, tmp_path):
+    """A streamed title must not hide TTS text appended after streaming ended."""
+    runner = _bootstrap(monkeypatch, tmp_path)
+    photon = Platform("photon")
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id="followup"))
+    runner.adapters = {photon: adapter}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._deliver_media_from_response = AsyncMock()
+    source = SessionSource(platform=photon, chat_id="any;-;+15550000000", chat_type="dm")
+    event = MessageEvent(text="hello", source=source, message_id="incoming")
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Audio ready.\nMEDIA:/tmp/reply.mp3",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "already_sent": True,
+            "_photon_tts_text_followup": "The complete spoken reply.",
+        }
+    )
+
+    await runner._handle_message_with_agent(event, source, "agent:main:photon:dm:any", 1)
+
+    assert any(
+        call.args[1] == "The complete spoken reply."
+        for call in adapter.send.await_args_list
+    )
+    runner._deliver_media_from_response.assert_awaited_once()
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
