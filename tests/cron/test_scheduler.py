@@ -597,7 +597,6 @@ class TestRoutingIntents:
         )
         for var in env_vars:
             monkeypatch.delenv(var, raising=False)
-
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
     def test_origin_comma_all_preserves_origin_first(self, monkeypatch):

@@ -72,6 +72,11 @@ import {
   shouldProbe,
   isZombieSuspect,
 } from "./stream-staleness.mjs";
+import { prepareVoiceMedia } from "./voice-media.mjs";
+import {
+  attachmentReadStreamError,
+  readInboundAttachmentWithRetry,
+} from "./inbound-media.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;

@@ -136,6 +136,22 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
     monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
     (tmp_path / "node_modules" / "spectrum-ts").mkdir(parents=True)
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
+    installs = []
+
+    def _install() -> None:
+        installs.append(True)
+        modules = tmp_path / "node_modules" / "ffmpeg-static"
+        modules.mkdir(parents=True)
+        (modules / "index.js").write_text("")
+        (modules / ("ffmpeg.exe" if photon_adapter.sys.platform == "win32" else "ffmpeg")).write_text("")
+        imessage = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+        imessage.parent.mkdir(parents=True)
+        imessage.write_text(
+            "Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
+
+    monkeypatch.setattr(photon_adapter, "_reinstall_sidecar_deps", _install)
 
     spawned: Dict[str, Any] = {}
     hidden_flags = 0x08000000
