@@ -394,12 +394,22 @@ def _setup_update_mocks(monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
     monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
     monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_update_archive_ref",
+        lambda branch, sha, attempt=0: (
+            f"refs/heads/hermes-backup/{branch}-fixed-{sha[:12]}"
+            f"{'-' + str(attempt) if attempt else ''}"
+        ),
+    )
 
 
 def test_cmd_update_retries_optional_extras_individually_when_all_fails(monkeypatch, tmp_path, capsys):
     """When .[all] fails, update should keep base deps and retry extras individually."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
     monkeypatch.setattr(hermes_main, "_is_termux_env", lambda env=None: False)
     monkeypatch.setattr(hermes_main, "_load_installable_optional_extras", lambda group="all": ["matrix", "mcp"])
 
@@ -529,6 +539,7 @@ def test_install_heartbeat_prints_when_dependency_install_is_silent(monkeypatch,
 
 def _make_update_side_effect(
     current_branch="main",
+    target_branch="main",
     commit_count="3",
     commit_count_returncode=0,
     local_commit_count="0",
@@ -543,11 +554,15 @@ def _make_update_side_effect(
     rebase_fails=False,
     abort_fails=False,
     head_sha="abc123def456",
+    mirror_sha=None,
+    archive_collisions=0,
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
+    archive_observations = 0
 
     def side_effect(cmd, **kwargs):
+        nonlocal archive_observations
         recorded.append(cmd)
         joined = " ".join(str(c) for c in cmd)
         if "fetch" in joined and "origin" in joined:
@@ -564,9 +579,25 @@ def _make_update_side_effect(
                 stderr="",
                 returncode=0 if push_remote else 1,
             )
-        if "checkout" in joined and "main" in joined:
+        if "ls-remote" in joined:
+            remote_ref = str(cmd[-1])
+            if remote_ref.startswith("refs/heads/hermes-backup/"):
+                archive_observations += 1
+                if archive_observations <= archive_collisions:
+                    return SimpleNamespace(
+                        stdout=f"occupied{archive_observations} {remote_ref}\n",
+                        stderr="",
+                        returncode=0,
+                    )
+                return SimpleNamespace(stdout="", stderr="", returncode=0)
+            return SimpleNamespace(
+                stdout=f"{mirror_sha} {remote_ref}\n" if mirror_sha else "",
+                stderr="",
+                returncode=0,
+            )
+        if "checkout" in joined and target_branch in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
-        if "rev-list" in joined and "origin/main..HEAD" in joined:
+        if "rev-list" in joined and f"origin/{target_branch}..HEAD" in joined:
             return SimpleNamespace(
                 stdout=f"{local_commit_count}\n",
                 stderr="local probe failed\n" if local_commit_returncode else "",
@@ -587,7 +618,11 @@ def _make_update_side_effect(
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
         if "push" in joined:
-            if "--force-with-lease" in joined and mirror_fails:
+            if (
+                "--force-with-lease" in joined
+                and mirror_fails
+                and any(str(arg).startswith("HEAD:refs/heads/") for arg in cmd)
+            ):
                 return SimpleNamespace(stdout="", stderr="lease rejected\n", returncode=1)
             if push_fails:
                 return SimpleNamespace(stdout="", stderr="push failed\n", returncode=1)
@@ -948,6 +983,7 @@ def test_cmd_update_backs_up_and_rebases_committed_local_divergence(
         ff_only_fails=True,
         local_commit_count="23",
         push_remote="fork",
+        mirror_sha="fork-before",
     )
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
@@ -956,11 +992,17 @@ def test_cmd_update_backs_up_and_rebases_committed_local_divergence(
     push_calls = [cmd for cmd in recorded if "push" in cmd]
     rebase_calls = [cmd for cmd in recorded if "rebase" in cmd]
     assert push_calls == [
-        ["git", "push", "fork", "HEAD:refs/heads/main"],
         [
             "git",
             "push",
-            "--force-with-lease=refs/heads/main:abc123def456",
+            "--force-with-lease=refs/heads/hermes-backup/main-fixed-abc123def456:",
+            "fork",
+            "abc123def456:refs/heads/hermes-backup/main-fixed-abc123def456",
+        ],
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/main:fork-before",
             "fork",
             "HEAD:refs/heads/main",
         ],
@@ -968,7 +1010,8 @@ def test_cmd_update_backs_up_and_rebases_committed_local_divergence(
     assert rebase_calls == [["git", "rebase", "origin/main"]]
     assert not [cmd for cmd in recorded if "reset" in cmd and "--hard" in cmd]
     out = capsys.readouterr().out
-    assert "Backing up 23 local commit" in out
+    assert "Archiving 23 local commit" in out
+    assert "Archive created: fork/hermes-backup/main-fixed-abc123def456" in out
     assert "rebased and mirrored to fork/main" in out
 
 
@@ -1023,7 +1066,10 @@ def test_cmd_update_aborts_conflicted_rebase_and_keeps_backup(
         hermes_main.cmd_update(SimpleNamespace())
 
     assert ["git", "rebase", "--abort"] in recorded
-    assert "Backup remains available on fork/main" in capsys.readouterr().out
+    assert (
+        "Backup remains available on fork/hermes-backup/main-fixed-abc123def456"
+        in capsys.readouterr().out
+    )
 
 
 def test_cmd_update_reports_failed_rebase_abort(monkeypatch, tmp_path, capsys):
@@ -1064,8 +1110,109 @@ def test_cmd_update_rolls_back_when_explicit_lease_rejects_mirror(
     with pytest.raises(SystemExit, match="1"):
         hermes_main.cmd_update(SimpleNamespace())
 
+    assert [
+        "git",
+        "push",
+        "--force-with-lease=refs/heads/main:",
+        "fork",
+        "HEAD:refs/heads/main",
+    ] in recorded
     assert ["git", "reset", "--hard", "abc123def456"] in recorded
-    assert "local rebase was rolled back" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "local rebase was rolled back" in out
+    assert (
+        "Archive remains available at fork/hermes-backup/main-fixed-abc123def456"
+        in out
+    )
+
+
+def test_cmd_update_uses_expected_absence_lease_for_new_mirror(
+    monkeypatch, tmp_path
+):
+    """A mirror observed absent must not overwrite a branch created later."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    mirror_calls = [
+        cmd for cmd in recorded if "push" in cmd and "HEAD:refs/heads/main" in cmd
+    ]
+    assert mirror_calls == [
+        [
+            "git",
+            "push",
+            "--force-with-lease=refs/heads/main:",
+            "fork",
+            "HEAD:refs/heads/main",
+        ]
+    ]
+
+
+def test_cmd_update_archive_collision_uses_unused_suffix(monkeypatch, tmp_path):
+    """An occupied archival name is preserved and a suffixed ref is used."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        archive_collisions=1,
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    archive_push = next(
+        cmd
+        for cmd in recorded
+        if "push" in cmd and any("hermes-backup/" in str(arg) for arg in cmd)
+    )
+    assert archive_push[2].endswith("main-fixed-abc123def456-1:")
+    assert archive_push[-1].endswith("main-fixed-abc123def456-1")
+
+
+def test_cmd_update_non_default_branch_uses_its_remote_and_ref(monkeypatch, tmp_path):
+    """The archival and mirror protocol follows --branch, not hard-coded main."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="release-candidate",
+        target_branch="release-candidate",
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="qa-fork",
+        mirror_sha="qa-before",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace(branch="release-candidate"))
+
+    assert ["git", "rebase", "origin/release-candidate"] in recorded
+    assert any(
+        cmd[-1].endswith(
+            ":refs/heads/hermes-backup/release-candidate-fixed-abc123def456"
+        )
+        for cmd in recorded
+        if "push" in cmd
+    )
+    assert [
+        "git",
+        "push",
+        "--force-with-lease=refs/heads/release-candidate:qa-before",
+        "qa-fork",
+        "HEAD:refs/heads/release-candidate",
+    ] in recorded
 
 
 def test_cmd_update_validates_syntax_before_mirroring_rebased_history(
@@ -1090,7 +1237,10 @@ def test_cmd_update_validates_syntax_before_mirroring_rebased_history(
         hermes_main.cmd_update(SimpleNamespace())
 
     push_calls = [cmd for cmd in recorded if "push" in cmd]
-    assert push_calls == [["git", "push", "fork", "HEAD:refs/heads/main"]]
+    assert len(push_calls) == 1
+    assert push_calls[0][-1].endswith(
+        ":refs/heads/hermes-backup/main-fixed-abc123def456"
+    )
 
 
 def test_cmd_update_no_reset_when_ff_only_succeeds(monkeypatch, tmp_path):
