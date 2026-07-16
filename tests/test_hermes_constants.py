@@ -415,6 +415,33 @@ class TestIsContainer:
         monkeypatch.setattr("builtins.open", _fake_open)
         assert is_container() is True
 
+    def test_ignores_container_storage_mounted_on_host(self, monkeypatch, tmp_path):
+        """Docker storage mounts do not mean the current process is containerized."""
+        import builtins
+
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text("0::/\n")
+        mountinfo_file = tmp_path / "mountinfo"
+        mountinfo_file.write_text(
+            "31 1 8:1 / / rw - ext4 /dev/sda rw\n"
+            "3920 31 0:73 / /var/lib/docker/rootfs/overlayfs/abc rw "
+            "- overlay overlay rw,lowerdir=/var/lib/containerd/snapshots/1/fs\n"
+        )
+        _real_open = builtins.open
+
+        def _fake_open(p, *a, **kw):
+            if p == "/proc/1/cgroup":
+                return _real_open(str(cgroup_file), *a, **kw)
+            if p == "/proc/self/mountinfo":
+                return _real_open(str(mountinfo_file), *a, **kw)
+            return _real_open(p, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", _fake_open)
+        assert is_container() is False
+
     def test_caches_result(self, monkeypatch):
         """Second call uses cached value without re-probing."""
         monkeypatch.setattr(hermes_constants, "_container_detected", True)

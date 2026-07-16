@@ -1025,6 +1025,9 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech_tool",
     "image_generate",
 }
+_TTS_MEDIA_TOOL_NAMES = frozenset({"text_to_speech", "text_to_speech_tool"})
+_PHOTON_AUDIO_EXTENSIONS = frozenset({".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"})
+
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
 
@@ -1099,6 +1102,7 @@ def _collect_auto_append_media_tags(
     messages: List[Dict[str, Any]],
     history_offset: int = 0,
     history_media_paths: Optional[set] = None,
+    keep_latest_tts_only: bool = False,
 ) -> tuple[List[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
@@ -1139,6 +1143,8 @@ def _collect_auto_append_media_tags(
 
     media_tags: List[str] = []
     has_voice_directive = False
+    latest_tts_tags: List[str] = []
+    latest_tts_has_voice_directive = False
     for msg in new_messages:
         if msg.get("role") not in ("tool", "function"):
             continue
@@ -1166,14 +1172,120 @@ def _collect_auto_append_media_tags(
             continue
         if "MEDIA:" not in content:
             continue
+        found_tags: List[str] = []
         for match in _TOOL_MEDIA_RE.finditer(content):
             path = match.group(1).strip().rstrip('",}')
             if path and path not in history_media_paths:
-                media_tags.append(f"MEDIA:{path}")
+                found_tags.append(f"MEDIA:{path}")
+        if keep_latest_tts_only and tool_name in {"text_to_speech", "text_to_speech_tool"}:
+            if found_tags:
+                latest_tts_tags = found_tags
+                latest_tts_has_voice_directive = "[[audio_as_voice]]" in content
+            continue
+        media_tags.extend(found_tags)
         if "[[audio_as_voice]]" in content:
             has_voice_directive = True
 
+    if keep_latest_tts_only and latest_tts_tags:
+        media_tags.append(latest_tts_tags[-1])
+        has_voice_directive = has_voice_directive or latest_tts_has_voice_directive
+
     return media_tags, has_voice_directive
+
+
+def _collect_latest_successful_tts_media(
+    messages: List[Dict[str, Any]],
+    history_offset: int = 0,
+    history_media_paths: Optional[set] = None,
+) -> tuple[str, str]:
+    """Return the latest TTS media tag together with the text that created it."""
+    if history_offset and len(messages) >= history_offset:
+        new_messages = messages[history_offset:]
+    else:
+        new_messages = messages
+
+    history_media_paths = history_media_paths or set()
+    tts_text_by_call_id: Dict[str, str] = {}
+    for msg in new_messages:
+        if msg.get("role") != "assistant":
+            continue
+        for call in msg.get("tool_calls") or []:
+            call_id = str(call.get("id") or call.get("call_id") or "")
+            fn = call.get("function") or {}
+            tool_name = str(fn.get("name") or call.get("name") or "")
+            if not call_id or tool_name not in _TTS_MEDIA_TOOL_NAMES:
+                continue
+            raw_args = fn.get("arguments") or call.get("arguments") or {}
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            if isinstance(raw_args, dict):
+                text = raw_args.get("text")
+                if isinstance(text, str) and text.strip():
+                    tts_text_by_call_id[call_id] = text.strip()
+
+    latest_tag = ""
+    latest_text = ""
+    for msg in new_messages:
+        if msg.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
+        if call_id not in tts_text_by_call_id:
+            continue
+        content = str(msg.get("content") or "")
+        for match in _TOOL_MEDIA_RE.finditer(content):
+            path = match.group(1).strip().rstrip('\",}')
+            if (
+                Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS
+                and path not in history_media_paths
+            ):
+                latest_tag = f"MEDIA:{path}"
+                latest_text = tts_text_by_call_id[call_id]
+    return latest_tag, latest_text
+
+
+def _normalize_photon_audio_media_tags(response: str, preferred_audio_tag: str = "") -> str:
+    """Cap Photon audio tags in a reply to one selected native voice artifact."""
+    matches = list(_TOOL_MEDIA_RE.finditer(response or ""))
+    audio_matches = [
+        match for match in matches
+        if Path(match.group(1).strip().rstrip('\",}')).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS
+    ]
+    selected_tag = preferred_audio_tag
+    if not selected_tag and audio_matches:
+        selected_path = audio_matches[-1].group(1).strip().rstrip('\",}')
+        selected_tag = "MEDIA:" + selected_path
+    if not audio_matches:
+        if selected_tag and selected_tag not in (response or ""):
+            return f"{(response or '').rstrip()}\n{selected_tag}".lstrip()
+        return response
+
+    parts: List[str] = []
+    cursor = 0
+    emitted_audio = False
+    for match in matches:
+        parts.append(response[cursor:match.start()])
+        path = match.group(1).strip().rstrip('\",}')
+        if Path(path).suffix.lower() in _PHOTON_AUDIO_EXTENSIONS:
+            if not emitted_audio:
+                parts.append(selected_tag)
+                emitted_audio = True
+        else:
+            parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(response[cursor:])
+    return "".join(parts).strip()
+
+
+def _ensure_photon_tts_text_reply(final_response: str, tts_text: str) -> str:
+    """Keep Photon text complete when the agent also requested TTS output."""
+    final_text = (final_response or "").strip()
+    spoken_text = (tts_text or "").strip()
+    if not spoken_text or spoken_text in final_text:
+        return final_text
+    return f"{final_text}\n\n{spoken_text}" if final_text else spoken_text
 
 
 def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
@@ -12590,6 +12702,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
+                        _photon_tts_followup = agent_result.get("_photon_tts_text_followup")
+                        if _photon_tts_followup:
+                            try:
+                                await _media_adapter.send(
+                                    source.chat_id,
+                                    _photon_tts_followup,
+                                    metadata=self._thread_metadata_for_source(
+                                        source, self._reply_anchor_for_event(event)
+                                    ),
+                                )
+                            except Exception as _followup_error:
+                                logger.warning(
+                                    "Photon streamed TTS text follow-up failed: %s",
+                                    _followup_error,
+                                )
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
@@ -13677,6 +13804,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            local_files = BasePlatformAdapter.exclude_media_duplicate_local_paths(
+                media_files, local_files
+            )
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
@@ -13744,7 +13874,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
-                    if ext in _VIDEO_EXTS:
+                    if should_send_media_as_audio(event.source.platform, ext):
+                        await adapter.send_voice(
+                            chat_id=event.source.chat_id,
+                            audio_path=file_path,
+                            metadata=_thread_meta,
+                        )
+                    elif ext in _VIDEO_EXTS:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
@@ -15714,7 +15850,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    # ponytail: transcript is echoed separately; avoid sending it twice.
+                    enriched_parts.append(
+                        f'"{transcript}"\n\n'
+                        "[The transcript above was already sent to the user. "
+                        "Reply to it without repeating it.]"
+                    )
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
@@ -19836,11 +19977,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
+            # Photon voice replies have a one-attachment contract: use the
+            # latest TTS artifact and include its complete spoken text as a
+            # normal text message, never merely a tool-generated title.
+            _is_photon_delivery = (
+                getattr(source.platform, "value", source.platform) == "photon"
+            )
+            _photon_tts_tag = ""
+            _photon_tts_text = ""
+            if _is_photon_delivery:
+                _photon_tts_tag, _photon_tts_text = _collect_latest_successful_tts_media(
+                    result.get("messages", []),
+                    history_offset=len(agent_history),
+                    history_media_paths=_history_media_paths,
+                )
+                final_response = _normalize_photon_audio_media_tags(
+                    final_response, _photon_tts_tag
+                )
             if "MEDIA:" not in final_response:
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),
                     history_media_paths=_history_media_paths,
+                    keep_latest_tts_only=_is_photon_delivery,
                 )
 
                 if media_tags:
@@ -19853,6 +20012,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if has_voice_directive:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
+            if _is_photon_delivery:
+                _before_photon_tts_text = final_response
+                final_response = _ensure_photon_tts_text_reply(
+                    final_response, _photon_tts_text
+                )
+                if final_response != _before_photon_tts_text:
+                    result["_photon_tts_text_followup"] = _photon_tts_text
             
             # Auto-generate session title after first exchange (non-blocking)
             if final_response and self._session_db:
@@ -19923,6 +20089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "_photon_tts_text_followup": result.get("_photon_tts_text_followup"),
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

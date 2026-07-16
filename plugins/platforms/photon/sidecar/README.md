@@ -9,19 +9,22 @@ The sidecar:
 - runs `Spectrum({ projectId, projectSecret, providers: [imessage.config()] })`
 - exposes a loopback-only HTTP control channel for the Python adapter
   to push send/typing requests (auth via `X-Hermes-Sidecar-Token`)
-- drains the inbound message stream so `spectrum-ts` keeps its
-  reconnect/heartbeat machinery alive (real inbound delivery is via
-  Photon's signed webhook hitting our Python aiohttp server)
+- drains Spectrum's inbound gRPC message stream and forwards normalized
+  events to the Python adapter over its loopback-only `/inbound` NDJSON
+  channel; the SDK handles connection recovery, while the sidecar re-subscribes
+  after stream errors/ends and emits loopback keepalive heartbeats
 
 ## Install
 
 ```bash
 cd plugins/platforms/photon/sidecar
-npm install
+npm ci
 ```
 
-The Hermes plugin's `hermes photon setup` command runs `npm install`
-here automatically.
+`npm ci` installs the committed lockfile exactly. Hermes setup/update falls
+back to `npm install` if `npm ci` fails (for example, when the lockfile is
+absent or temporarily drifted). The canonical first-time path is
+`hermes gateway setup`.
 
 ## Run standalone
 
