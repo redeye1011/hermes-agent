@@ -58,6 +58,11 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import { prepareVoiceMedia } from "./voice-media.mjs";
+import {
+  attachmentReadStreamError,
+  readInboundAttachmentWithRetry,
+} from "./inbound-media.mjs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
 const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -371,7 +376,8 @@ async function normalizeBinaryContent(content) {
   // STT on voice notes). Spectrum content objects may not outlive this stream
   // iteration, so a lazy/on-demand fetch isn't safe. Over-cap content (when
   // size is known up front) is forwarded as metadata only and the adapter falls
-  // back to a text marker. A read failure must never break the inbound loop.
+  // back to a text marker. Exhausted reads restart the stream so catch-up can
+  // replay the message with its bytes instead of deduping a metadata-only event.
   const label = `${content.type} ${meta.name ?? meta.id ?? "(unnamed)"}`;
   if (meta.size !== null && meta.size > MAX_INLINE_ATTACHMENT_BYTES) {
     console.error(
@@ -382,7 +388,9 @@ async function normalizeBinaryContent(content) {
   }
   if (typeof content.read === "function") {
     try {
-      const buf = await content.read();
+      const buf = await readInboundAttachmentWithRetry(
+        () => content.read(),
+      );
       // Guard the case where size was unknown but the bytes turn out to be
       // over the cap.
       if (buf && buf.length > MAX_INLINE_ATTACHMENT_BYTES) {
@@ -397,9 +405,10 @@ async function normalizeBinaryContent(content) {
     } catch (e) {
       console.error(
         `photon-sidecar: failed to read ${content.type} bytes ` +
-          "(forwarding metadata only): " +
+          "(restarting inbound stream): " +
           (e && e.stack ? e.stack : String(e))
       );
+      throw attachmentReadStreamError(e);
     }
   }
   return meta;
@@ -491,6 +500,7 @@ async function normalizeEvent(space, message) {
         ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
     };
   } catch (e) {
+    if (e?.retryPhotonInboundStream) throw e;
     console.error(
       "photon-sidecar: failed to normalize inbound message: " + String(e)
     );
@@ -743,32 +753,40 @@ const server = http.createServer(async (req, res) => {
       }
       const space = await resolveSpace(spaceId);
 
-      // spectrum-ts infers name + MIME from the file extension; pass
-      // overrides only when Hermes supplied them so a known-good
-      // inference isn't clobbered with an empty string.
-      const opts = {};
-      if (name) opts.name = name;
-      if (mimeType) opts.mimeType = mimeType;
-      const builder =
-        kind === "voice"
-          ? voice(path, Object.keys(opts).length ? opts : undefined)
-          : attachment(path, Object.keys(opts).length ? opts : undefined);
-
-      const result = await space.send(builder);
-
-      // iMessage delivers the caption as a separate bubble; send it
-      // after the media so the attachment renders first.
-      if (caption && typeof caption === "string") {
-        try {
-          await space.send(spectrumText(caption));
-        } catch (e) {
-          console.error(
-            "photon-sidecar: attachment sent but caption failed: " +
-              (e && e.stack ? e.stack : String(e))
-          );
+      const voiceMedia =
+        kind === "voice" ? await prepareVoiceMedia({ path, name, mimeType }) : null;
+      try {
+        // spectrum-ts infers name + MIME from the file extension; pass
+        // overrides only when Hermes supplied them so a known-good
+        // inference isn't clobbered with an empty string.
+        const opts = {};
+        if (voiceMedia?.name ?? name) opts.name = voiceMedia?.name ?? name;
+        if (voiceMedia?.mimeType ?? mimeType) {
+          opts.mimeType = voiceMedia?.mimeType ?? mimeType;
         }
+        const builder =
+          kind === "voice"
+            ? voice(voiceMedia.path, Object.keys(opts).length ? opts : undefined)
+            : attachment(path, Object.keys(opts).length ? opts : undefined);
+
+        const result = await space.send(builder);
+
+        // iMessage delivers the caption as a separate bubble; send it
+        // after the media so the attachment renders first.
+        if (caption && typeof caption === "string") {
+          try {
+            await space.send(spectrumText(caption));
+          } catch (e) {
+            console.error(
+              "photon-sidecar: attachment sent but caption failed: " +
+                (e && e.stack ? e.stack : String(e))
+            );
+          }
+        }
+        return ok(res, { messageId: result?.id || null });
+      } finally {
+        await voiceMedia?.cleanup();
       }
-      return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/react") {
       const { spaceId, messageId, emoji } = body || {};
