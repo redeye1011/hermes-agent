@@ -353,6 +353,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # custom host resolution override/delete this explicitly.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
+    # Photon plugin discovery can lazily load the developer profile after the
+    # generic cleanup above. An explicit empty sentinel keeps dotenv from
+    # restoring the real home channel; Photon-specific tests opt in explicitly.
+    monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
