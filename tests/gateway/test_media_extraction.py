@@ -136,6 +136,128 @@ caption
         assert tags == []
         assert voice is False
 
+    def test_photon_keeps_only_latest_tts_attachment_and_preserves_spoken_text(self):
+        """Photon sends one converted voice attachment plus the complete spoken text."""
+        from gateway.run import (
+            _collect_auto_append_media_tags,
+            _collect_latest_successful_tts_media,
+            _ensure_photon_tts_text_reply,
+            _normalize_photon_audio_media_tags,
+        )
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tts_1",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": '{"text": "First spoken draft."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tts_1",
+                "content": '{"media_tag": "MEDIA:/tmp/first.mp3"}',
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_tts_2",
+                        "function": {
+                            "name": "text_to_speech",
+                            "arguments": '{"text": "The complete final spoken reply."}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_tts_2",
+                "content": '{"media_tag": "MEDIA:/tmp/final.mp3"}',
+            },
+            {"role": "assistant", "content": "Audio ready."},
+        ]
+
+        tags, _voice = _collect_auto_append_media_tags(
+            messages, history_offset=0, keep_latest_tts_only=True
+        )
+        assert tags == ["MEDIA:/tmp/final.mp3"]
+        selected_tag, selected_text = _collect_latest_successful_tts_media(
+            messages, history_offset=0
+        )
+        assert (selected_tag, selected_text) == (
+            "MEDIA:/tmp/final.mp3", "The complete final spoken reply."
+        )
+        assert _ensure_photon_tts_text_reply("Audio ready.", selected_text) == (
+            "Audio ready.\n\nThe complete final spoken reply."
+        )
+        assert _normalize_photon_audio_media_tags(
+            "Audio ready.\nMEDIA:/tmp/first.mp3\nMEDIA:/tmp/final.mp3",
+            selected_tag,
+        ) == "Audio ready.\nMEDIA:/tmp/final.mp3"
+
+
+    def test_photon_uses_text_from_latest_tts_artifact_not_later_failed_call(self):
+        """The one Photon M4A and its visible text must originate from one call."""
+        from gateway.run import _collect_latest_successful_tts_media
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "ok", "function": {
+                        "name": "text_to_speech",
+                        "arguments": '{"text": "Delivered speech."}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "ok", "content": "MEDIA:/tmp/ok.mp3"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "failed", "function": {
+                        "name": "text_to_speech",
+                        "arguments": '{"text": "Failed speech must not be shown."}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "failed", "content": "TTS provider unavailable"},
+        ]
+
+        assert _collect_latest_successful_tts_media(messages, history_offset=0) == (
+            "MEDIA:/tmp/ok.mp3", "Delivered speech."
+        )
+
+
+    def test_photon_compaction_does_not_replay_historical_tts_media(self):
+        """A shrunk message list must not resurrect an older Photon voice reply."""
+        from gateway.run import _collect_latest_successful_tts_media
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "old", "function": {
+                        "name": "text_to_speech",
+                        "arguments": '{"text": "Old reply."}',
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "MEDIA:/tmp/old.mp3"},
+        ]
+
+        assert _collect_latest_successful_tts_media(
+            messages,
+            history_offset=10,
+            history_media_paths={"/tmp/old.mp3"},
+        ) == ("", "")
+
+
     def test_gateway_auto_append_keeps_real_tts_media_tag(self):
         """TTS tool media tags are still auto-appended when the model omits them."""
         from gateway.run import _collect_auto_append_media_tags
