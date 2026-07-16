@@ -4535,6 +4535,55 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _observe_remote_branch(
+    git_cmd, cwd, remote: str, branch: str
+) -> tuple[bool, str | None, str]:
+    """Authoritatively read ``remote/branch`` without trusting tracking refs.
+
+    ``(True, None, "")`` means the branch was confirmed absent. A failed
+    ``ls-remote`` returns ``(False, None, stderr)`` so callers never confuse a
+    network/authentication failure with absence.
+    """
+    result = subprocess.run(
+        git_cmd + ["ls-remote", "--heads", remote, f"refs/heads/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False, None, result.stderr.strip()
+    line = result.stdout.strip().splitlines()
+    if not line:
+        return True, None, ""
+    sha = line[0].split(None, 1)[0]
+    return (True, sha, "") if sha else (False, None, "invalid ls-remote output")
+
+
+def _update_archive_ref(branch: str, backup_sha: str, attempt: int = 0) -> str:
+    """Build a readable, unique namespace for a pre-rebase commit archive."""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch_label = branch.replace("/", "-")
+    suffix = f"-{attempt}" if attempt else ""
+    return f"refs/heads/hermes-backup/{branch_label}-{timestamp}-{backup_sha[:12]}{suffix}"
+
+
+def _select_update_archive_ref(
+    git_cmd, cwd, remote: str, branch: str, backup_sha: str
+) -> tuple[str | None, str]:
+    """Choose an archive ref confirmed absent on the destination remote."""
+    for attempt in range(100):
+        archive_ref = _update_archive_ref(branch, backup_sha, attempt)
+        archive_branch = archive_ref.removeprefix("refs/heads/")
+        observed, existing_sha, error = _observe_remote_branch(
+            git_cmd, cwd, remote, archive_branch
+        )
+        if not observed:
+            return None, error
+        if existing_sha is None:
+            return archive_ref, ""
+    return None, "could not find an unused archival ref after 100 attempts"
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -10374,6 +10423,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         rebase_push_remote: Optional[str] = None
         rebase_backup_sha: Optional[str] = None
+        rebase_archive_ref: Optional[str] = None
+        rebase_mirror_sha: Optional[str] = None
         try:
             try:
                 pull_result = subprocess.run(
@@ -10451,11 +10502,44 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
+                    mirror_observed, mirror_sha, mirror_error = _observe_remote_branch(
+                        git_cmd, PROJECT_ROOT, push_remote, branch
+                    )
+                    if not mirror_observed:
+                        print(
+                            f"✗ Could not observe {push_remote}/{branch}; update stopped before rebase."
+                        )
+                        if mirror_error:
+                            print(f"  {mirror_error}")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    archive_ref, archive_error = _select_update_archive_ref(
+                        git_cmd, PROJECT_ROOT, push_remote, branch, backup_sha
+                    )
+                    if not archive_ref:
+                        print(
+                            "✗ Could not reserve an archival backup ref; "
+                            "update stopped before rebase."
+                        )
+                        if archive_error:
+                            print(f"  {archive_error}")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    archive_label = archive_ref.removeprefix("refs/heads/")
                     print(
-                        f"  → Backing up {local_ahead} local commit(s) to {push_remote}/{branch}..."
+                        f"  → Archiving {local_ahead} local commit(s) to "
+                        f"{push_remote}/{archive_label}..."
                     )
                     backup_result = subprocess.run(
-                        git_cmd + ["push", push_remote, f"HEAD:refs/heads/{branch}"],
+                        git_cmd
+                        + [
+                            "push",
+                            f"--force-with-lease={archive_ref}:",
+                            push_remote,
+                            f"{backup_sha}:{archive_ref}",
+                        ],
                         cwd=PROJECT_ROOT,
                         capture_output=True,
                         text=True,
@@ -10464,8 +10548,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("✗ Could not back up local commits; update stopped before rebase.")
                         if backup_result.stderr.strip():
                             print(f"  {backup_result.stderr.strip()}")
+                        print(
+                            "  No existing ref was overwritten: "
+                            f"{push_remote}/{archive_label}"
+                        )
                         _restore_checkout_after_safe_failure()
                         sys.exit(1)
+
+                    print(f"  ✓ Archive created: {push_remote}/{archive_label}")
+                    print(f"    Recover with: git fetch {push_remote} {archive_ref}")
 
                     print(f"  → Rebasing local commits onto origin/{branch}...")
                     _mark_update_unsafe()
@@ -10486,12 +10577,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             print("✗ Rebase conflicted and automatic abort failed.")
                             if abort_result.stderr.strip():
                                 print(f"  {abort_result.stderr.strip()}")
-                            print(f"  Recover from {push_remote}/{branch} before restarting Hermes.")
+                            print(
+                                f"  Recover from {push_remote}/{archive_label} before restarting Hermes."
+                            )
                             sys.exit(1)
                         print("✗ Rebase conflicted; original local history was restored.")
                         if rebase_result.stderr.strip():
                             print(f"  {rebase_result.stderr.strip()}")
-                        print(f"  Backup remains available on {push_remote}/{branch}.")
+                        print(
+                            f"  Backup remains available on {push_remote}/{archive_label}."
+                        )
                         _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
@@ -10500,6 +10595,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # prevents overwriting a concurrent remote update.
                     rebase_push_remote = push_remote
                     rebase_backup_sha = backup_sha
+                    rebase_archive_ref = archive_ref
+                    rebase_mirror_sha = mirror_sha
 
                 # No committed local work is ahead. This is a rewritten remote
                 # history, so reset is safe and preserves the historical recovery
@@ -10565,12 +10662,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
 
-            if rebase_push_remote and rebase_backup_sha:
+            if rebase_push_remote and rebase_backup_sha and rebase_archive_ref:
+                mirror_lease = (
+                    f"--force-with-lease=refs/heads/{branch}:{rebase_mirror_sha or ''}"
+                )
                 mirror_result = subprocess.run(
                     git_cmd
                     + [
                         "push",
-                        f"--force-with-lease=refs/heads/{branch}:{rebase_backup_sha}",
+                        mirror_lease,
                         rebase_push_remote,
                         f"HEAD:refs/heads/{branch}",
                     ],
@@ -10590,12 +10690,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         if rollback_result.stderr.strip():
                             print(f"  {rollback_result.stderr.strip()}")
                         print(
-                            f"  Recover from {rebase_push_remote}/{branch} before restarting Hermes."
+                            "  Recover from "
+                            f"{rebase_push_remote}/{rebase_archive_ref.removeprefix('refs/heads/')} "
+                            "before restarting Hermes."
                         )
                         sys.exit(1)
                     print("✗ Backup mirror changed concurrently; local rebase was rolled back.")
                     if mirror_result.stderr.strip():
                         print(f"  {mirror_result.stderr.strip()}")
+                    print(
+                        "  Archive remains available at "
+                        f"{rebase_push_remote}/{rebase_archive_ref.removeprefix('refs/heads/')}."
+                    )
                     _restore_checkout_after_safe_failure()
                     sys.exit(1)
                 print(
