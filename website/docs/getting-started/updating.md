@@ -25,11 +25,18 @@ This pulls the latest code from `main`, updates dependencies, and prompts you to
 When you run `hermes update`, the following steps occur:
 
 1. **Pre-update snapshot** — a lightweight state snapshot is saved by default (covers pairing data, cron jobs, `config.yaml`, `.env`, `auth.json`, and other state files that get modified at runtime; individual files over 1 GiB are skipped so a large sessions DB never slows the update down). Controlled by `updates.pre_update_backup` (`quick` by default, `full` for a zip of all of `HERMES_HOME`, `off` to disable). Recoverable via the snapshot restore flow described under [Snapshots and rollback](../user-guide/checkpoints-and-rollback.md).
-2. **Git pull** — pulls the latest code from the `main` branch and updates submodules
+2. **Git pull** — pulls the latest code from the `main` branch and updates submodules. If committed local work prevents a fast-forward and the branch has a configured `pushRemote`, Hermes first pushes the exact pre-rebase commit to a unique `hermes-backup/...` archival ref, then rebases the local commits onto upstream. Existing archival refs are never overwritten.
 3. **Post-pull syntax validation + auto-rollback** — after the pull, Hermes compiles the eight critical files every `hermes` invocation imports at startup. If any fails to parse (e.g. an orphan merge-conflict marker, an accidentally truncated file), Hermes runs `git reset --hard <pre-pull-sha>` to roll the install back so your shell stays bootable. Re-run `hermes update` once the upstream fix lands.
 4. **Dependency install** — runs `uv pip install -e ".[all]"` to pick up new or changed dependencies
 5. **Config migration** — detects new config options added since your version and prompts you to set them
 6. **Gateway auto-restart** — running gateways are refreshed after the update completes so the new code takes effect immediately. Service-managed gateways (systemd on Linux, launchd on macOS) are restarted through the service manager. Manual gateways are relaunched automatically when Hermes can map the running PID back to a profile.
+
+After a successful rebase, Hermes mirrors the updated branch to its configured
+`pushRemote`. The archival ref remains on the remote as an immutable recovery
+point. Mirror updates use the remote branch SHA observed immediately before the
+rebase as an explicit Git lease; if another process changes or creates that
+branch meanwhile, the mirror push is rejected and Hermes restores the local
+pre-rebase commit instead of overwriting concurrent work.
 
 ### Updating against a non-default branch: `--branch`
 
