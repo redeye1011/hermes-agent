@@ -1,6 +1,7 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
 import hashlib
+import json
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,7 +37,11 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
 
 @pytest.fixture
-def mock_args():
+def mock_args(monkeypatch):
+    """Use an unconfigured Photon environment for generic updater tests."""
+    monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
+    monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
+    monkeypatch.setattr("hermes_cli.main._photon_configured", lambda: False)
     return SimpleNamespace()
 
 
@@ -195,6 +200,251 @@ class TestCmdUpdateNpmLockfileCache:
         (tmp_path / "apps" / "newtool").mkdir(parents=True)
         (tmp_path / "apps" / "newtool" / "package.json").write_text("{}")
         assert hm._npm_lockfile_changed(tmp_path) is True
+
+    def test_photon_sidecar_state_defeats_skip(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+        sidecar.mkdir(parents=True)
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "node_modules").mkdir()
+        packages = {
+            "node_modules/spectrum-ts": {"version": "8.0.0"},
+            "node_modules/@spectrum-ts/imessage": {"version": "8.0.0"},
+            "node_modules/@spectrum-ts/core": {"version": "8.0.0"},
+            "node_modules/ffmpeg-static": {"version": "5.2.0", "optional": True},
+        }
+        lock = json.dumps({"packages": packages})
+        (sidecar / "package-lock.json").write_text(lock)
+        (sidecar / "package.json").write_text("{}")
+        modules = sidecar / "node_modules"
+        (modules / "spectrum-ts" / "dist").mkdir(parents=True)
+        (modules / "@spectrum-ts" / "imessage" / "dist").mkdir(parents=True)
+        transitive = modules / "@spectrum-ts" / "core"
+        transitive.mkdir(parents=True)
+        (modules / "ffmpeg-static").mkdir()
+        (modules / ".package-lock.json").write_text(lock)
+        (modules / "spectrum-ts" / "dist" / "index.js").write_text("")
+        imessage_entry = modules / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+        imessage_entry.write_text(
+            "// Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "// Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
+        (modules / "ffmpeg-static" / "index.js").write_text("")
+        ffmpeg = modules / "ffmpeg-static" / (
+            "ffmpeg.exe" if hm.sys.platform == "win32" else "ffmpeg"
+        )
+        ffmpeg.write_text("")
+        if hm.sys.platform != "win32":
+            ffmpeg.chmod(0o755)
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_photon_sidecar_runtime_probe", lambda _sidecar: True)
+
+        hm._record_npm_lockfile_hash(tmp_path)
+        assert hm._npm_lockfile_changed(tmp_path) is False
+        monkeypatch.setattr(hm, "_photon_sidecar_runtime_probe", lambda _sidecar: False)
+        assert hm._npm_lockfile_changed(tmp_path) is True
+        monkeypatch.setattr(hm, "_photon_sidecar_runtime_probe", lambda _sidecar: True)
+        (sidecar / "package-lock.json").write_text('{"changed": true}')
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        (sidecar / "package-lock.json").write_text(lock)
+        hm._record_npm_lockfile_hash(tmp_path)
+        spectrum_entry = modules / "spectrum-ts" / "dist" / "index.js"
+        spectrum_entry.unlink()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        spectrum_entry.write_text("")
+        imessage_entry.unlink()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        imessage_entry.write_text(
+            "// Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "// Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
+        ffmpeg.unlink()
+        assert hm._npm_lockfile_changed(tmp_path) is False
+
+        ffmpeg.write_text("")
+        if hm.sys.platform != "win32":
+            ffmpeg.chmod(0o755)
+        imessage_entry.write_text(
+            "// Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "// Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
+        transitive.rmdir()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        if hm.sys.platform != "win32":
+            transitive.mkdir()
+            ffmpeg.write_text("")
+            ffmpeg.chmod(0o644)
+            assert hm._npm_lockfile_changed(tmp_path) is False
+
+    def test_failed_partial_photon_repair_invalidates_cache(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed repair must retry even if npm recreated probed artifacts."""
+        from hermes_cli import main as hm
+
+        sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+        modules = sidecar / "node_modules"
+        imessage = modules / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+        (tmp_path / "node_modules").mkdir()
+        sidecar.mkdir(parents=True)
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "package.json").write_text("{}")
+        (sidecar / "package-lock.json").write_text("{}")
+        (sidecar / "package.json").write_text("{}")
+        (modules / "spectrum-ts" / "dist").mkdir(parents=True)
+        imessage.parent.mkdir(parents=True)
+        (modules / "ffmpeg-static").mkdir()
+        (modules / ".package-lock.json").write_text("{}")
+        (modules / "spectrum-ts" / "dist" / "index.js").write_text("")
+        imessage.write_text("")
+        (modules / "ffmpeg-static" / "index.js").write_text("")
+        ffmpeg = modules / "ffmpeg-static" / (
+            "ffmpeg.exe" if hm.sys.platform == "win32" else "ffmpeg"
+        )
+        ffmpeg.write_text("")
+        if hm.sys.platform != "win32":
+            ffmpeg.chmod(0o755)
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        hm._record_npm_lockfile_hash(tmp_path)
+        cache_file = self._cache_file(tmp_path, tmp_path)
+        assert cache_file.is_file()
+        imessage.unlink()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+        def partial_install(npm, cwd, **kwargs):
+            if cwd == sidecar:
+                imessage.write_text("")
+                return subprocess.CompletedProcess([npm], 1, stdout="", stderr="failed")
+            return subprocess.CompletedProcess([npm], 0, stdout="", stderr="")
+
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: tmp_path)
+        monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+        monkeypatch.setattr(hm, "_run_npm_install_deterministic", partial_install)
+        monkeypatch.setattr(hm, "_photon_configured", lambda: False)
+
+        assert hm._update_node_dependencies() == []
+        assert not cache_file.exists()
+        assert hm._npm_lockfile_changed(tmp_path) is True
+
+    def test_cache_invalidation_failure_skips_dependency_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        """Never repair against a success marker that could not be invalidated."""
+        from hermes_cli import main as hm
+
+        sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+        sidecar.mkdir(parents=True)
+        (tmp_path / "package.json").write_text("{}")
+        (sidecar / "package.json").write_text("{}")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_photon_configured", lambda: True)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+        monkeypatch.setattr(hm, "_invalidate_npm_lockfile_hash", lambda _root: False)
+
+        installs = []
+        monkeypatch.setattr(
+            hm,
+            "_run_npm_install_deterministic",
+            lambda *args, **kwargs: installs.append((args, kwargs)),
+        )
+
+        token = {"resume_needed": True}
+        assert hm._update_node_dependencies(token) == ["repo root", "Photon sidecar"]
+        assert "unsafe_mutation_started" not in token
+        assert installs == []
+
+    def test_runtime_probe_executes_ffmpeg_binary(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        captured = []
+        monkeypatch.setattr("hermes_constants.find_node_executable", lambda _name: "/node")
+        monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+        def failed_probe(cmd, **kwargs):
+            captured.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        monkeypatch.setattr(hm.subprocess, "run", failed_probe)
+
+        assert hm._photon_sidecar_runtime_probe(tmp_path) is False
+        assert "spawnSync" in captured[0][-1]
+        assert "-version" in captured[0][-1]
+
+    def test_photon_configured_in_named_profile(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        default_home = tmp_path / ".hermes"
+        profile_home = default_home / "profiles" / "work"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  photon:\n"
+            "    extra:\n"
+            "      project_id: test-id\n"
+            "      project_secret: test-secret\n"
+        )
+        monkeypatch.delenv("PHOTON_PROJECT_ID", raising=False)
+        monkeypatch.delenv("PHOTON_PROJECT_SECRET", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.list_profiles",
+            lambda: [SimpleNamespace(path=profile_home)],
+        )
+
+        assert hm._photon_configured() is True
+
+        (profile_home / "config.yaml").unlink()
+        (profile_home / "gateway.json").write_text(
+            '{"platforms":{"photon":{"extra":'
+            '{"project_id":"test-id","project_secret":"test-secret"}}}}'
+        )
+        assert hm._photon_configured() is True
+
+        (profile_home / "gateway.json").unlink()
+        (profile_home / "auth.json").write_text(
+            '{"credential_pool":{"photon_project":[{'
+            '"spectrum_project_id":"test-id","project_secret":"test-secret"}]}}'
+        )
+        assert hm._photon_configured() is True
+
+    def test_photon_profile_enumeration_failure_is_conservative(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        def fail_profiles():
+            raise OSError("profile scan failed")
+
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", fail_profiles)
+        assert hm._photon_configured() is True
+
+    @pytest.mark.parametrize(
+        ("relative_path", "contents"),
+        [
+            (".env", b"\xff\xfe"),
+            ("auth.json", b"{"),
+            ("gateway.json", b"{"),
+            ("config.yaml", b"platforms: ["),
+        ],
+    )
+    def test_photon_configuration_read_failure_is_conservative(
+        self, tmp_path, monkeypatch, relative_path, contents
+    ):
+        from hermes_cli import main as hm
+
+        (tmp_path / relative_path).write_bytes(contents)
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+
+        assert hm._photon_configured() is True
 
     def test_npm_lockfile_changed_cache_read_error(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
@@ -392,10 +642,18 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_already_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, capsys, monkeypatch
     ):
+        from hermes_cli import main as hm
+
         mock_run.side_effect = _make_run_side_effect(
             branch="main", verify_ok=True, commit_count="0"
+        )
+        dependency_updates = []
+        monkeypatch.setattr(
+            hm,
+            "_update_node_dependencies",
+            lambda *_args: dependency_updates.append(True) or [],
         )
 
         cmd_update(mock_args)
@@ -407,6 +665,40 @@ class TestCmdUpdateBranchFallback:
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         pull_cmds = [c for c in commands if "pull" in c]
         assert len(pull_cmds) == 0
+        assert dependency_updates == [True]
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_current_checkout_stops_when_node_repair_fails(
+        self, mock_run, _mock_which, mock_args, monkeypatch
+    ):
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+        suppressed = []
+        resumed = []
+        monkeypatch.setattr(
+            hm, "_update_node_dependencies", lambda *_args: ["Photon sidecar"]
+        )
+        monkeypatch.setattr(
+            hm,
+            "_suppress_windows_gateway_resume",
+            lambda state: suppressed.append(state),
+        )
+        monkeypatch.setattr(
+            hm,
+            "_resume_windows_gateways_after_update",
+            lambda state: resumed.append(state),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
+
+        assert exc_info.value.code == 1
+        assert suppressed == []
+        assert resumed == []
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -455,6 +747,7 @@ class TestCmdUpdateBranchFallback:
         import subprocess as _subprocess
         build_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch.object(hm, "_is_termux_env", return_value=False), \
+             patch.object(hm, "_web_ui_build_needed", return_value=True), \
              patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle:
             cmd_update(mock_args)
 
@@ -467,9 +760,10 @@ class TestCmdUpdateBranchFallback:
         # cmd_update runs npm commands in these locations:
         #   1. repo root  — root-only install (--workspaces=false)
         #   2. repo root  — workspace install (--workspace ui-tui --workspace web)
-        #   3. web/       — npm ci --silent (if lockfile not at root)
+        #   3. Photon sidecar — independent lockfile for Spectrum/ffmpeg
+        #   4. web/       — npm ci --silent (if lockfile not at root)
         #                  via _build_web_ui (subprocess.run)
-        #   4. web/       — npm run build (_run_with_idle_timeout)
+        #   5. web/       — npm run build (_run_with_idle_timeout)
         #
         # With a single workspace lockfile at the repo root, the root
         # install covers all workspaces.  The web/ ci call runs from the
@@ -501,22 +795,30 @@ class TestCmdUpdateBranchFallback:
             "--workspace",
             "web",
         ]
-        assert npm_calls[:2] == [
+        sidecar_flags = [
+            "/usr/bin/npm",
+            "ci",
+            "--include=dev",
+            "--no-fund",
+            "--no-audit",
+            "--progress=false",
+        ]
+        photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+        assert npm_calls[:3] == [
             (root_flags, PROJECT_ROOT),
             (ws_flags, PROJECT_ROOT),
+            (sidecar_flags, photon_sidecar),
         ]
-        if len(npm_calls) > 2:
+        if len(npm_calls) > 3:
             # The web/ install runs from the workspace root when the root
             # lockfile exists (npm workspaces hoist node_modules upward).
-            assert npm_calls[2:] == [
+            assert npm_calls[3:] == [
                 (["/usr/bin/npm", "ci", "--include=dev", "--workspace", "web", "--silent"], PROJECT_ROOT),
             ]
 
-        # The web UI build itself went through the streaming helper.
+        # Standard source updates rebuild the web UI through the idle-timeout
+        # wrapper after dependencies have been refreshed.
         mock_idle.assert_called_once()
-        idle_args, idle_kwargs = mock_idle.call_args
-        assert idle_args[0] == ["/usr/bin/npm", "run", "build"]
-        assert idle_kwargs["cwd"] == PROJECT_ROOT / "web"
 
         # Regression for #18840: root npm installs must stream output
         # (capture_output=False) so postinstall progress is visible
@@ -751,6 +1053,8 @@ class TestCmdUpdateBranchFlag:
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
 
             if "checkout" in joined and "-B" not in joined and "rev-parse" not in joined:
+                if str(cmd[-1]) == current_branch:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
                 rc = 128 if checkout_fails else 0
                 err = f"error: pathspec '{target_branch}' did not match\n" if checkout_fails else ""
                 return subprocess.CompletedProcess(cmd, rc, stdout="", stderr=err)
@@ -1064,6 +1368,7 @@ termux = ["rich>=14"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
 
 
+
 class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
@@ -1242,3 +1547,524 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+@patch("shutil.which", return_value=None)
+@patch("subprocess.run")
+def test_cmd_update_does_not_continue_when_photon_sidecar_sync_fails(
+    mock_run, _mock_which, mock_args, capsys
+):
+    """A failed sidecar sync must stop before builds, completion, or restart."""
+    from hermes_cli import main as hm
+
+    mock_run.side_effect = _make_run_side_effect(branch="main", verify_ok=True, commit_count="1")
+    with patch.object(
+        hm, "_update_node_dependencies", return_value=["Photon sidecar"]
+    ), patch.object(hm, "_build_web_ui") as build_web:
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(mock_args)
+
+    build_web.assert_not_called()
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "Photon sidecar dependencies are not ready" in out
+    assert "gateway was not restarted" in out
+
+
+def test_update_node_dependencies_installs_photon_sidecar(tmp_path, monkeypatch):
+    """Photon keeps a separate lockfile outside the root npm workspaces."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    (sidecar_dir / "package-lock.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    installs = []
+
+    def fake_install(npm, cwd, **kwargs):
+        installs.append((npm, cwd, kwargs))
+        return subprocess.CompletedProcess([npm], 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+
+    hm._update_node_dependencies()
+
+    assert any(cwd == sidecar_dir for _npm, cwd, _kwargs in installs)
+
+
+def test_npm_spawn_error_returns_failure(tmp_path, monkeypatch):
+    from hermes_cli import main as hm
+
+    (tmp_path / "package-lock.json").write_text("{}")
+
+    def spawn_error(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "run", spawn_error)
+
+    result = hm._run_npm_install_deterministic("npm", tmp_path)
+
+    assert result.returncode != 0
+    assert "spawn failed" in result.stderr
+
+
+def test_update_node_dependencies_continues_to_photon_after_root_failure(tmp_path, monkeypatch):
+    """A root workspace warning must not skip the independent Photon sidecar."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    installs = []
+
+    def fake_install(npm, cwd, **kwargs):
+        installs.append(cwd)
+        return subprocess.CompletedProcess([npm], 1 if cwd == tmp_path else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+
+    assert hm._update_node_dependencies() == ["repo root"]
+    assert sidecar_dir in installs
+
+
+def test_update_node_dependencies_ignores_sidecar_sync_failure_when_photon_unconfigured(tmp_path, monkeypatch):
+    """An unused bundled plugin must not block a non-Photon update."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    def fake_install(npm, cwd, **kwargs):
+        return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+    monkeypatch.setattr(hm, "_photon_configured", lambda: False)
+
+    assert hm._update_node_dependencies() == []
+
+
+def test_update_node_dependencies_fails_when_configured_photon_sidecar_sync_fails(tmp_path, monkeypatch):
+    """Configured Photon must not restart with stale Spectrum/ffmpeg deps."""
+    from hermes_cli import main as hm
+
+    sidecar_dir = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar_dir.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar_dir / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+    monkeypatch.setattr(hm, "_photon_configured", lambda: True)
+
+    def fake_install(npm, cwd, **kwargs):
+        return subprocess.CompletedProcess([npm], 1 if cwd == sidecar_dir else 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
+    recorded = []
+    monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
+
+    assert hm._update_node_dependencies() == ["Photon sidecar"]
+    assert recorded == []
+
+
+def test_zero_exit_sidecar_install_requires_runtime_readiness(tmp_path, monkeypatch):
+    """A successful npm exit must not cache or restart a broken Photon runtime."""
+    from hermes_cli import main as hm
+
+    sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_photon_configured", lambda: True)
+    monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+    monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+    monkeypatch.setattr(hm, "_invalidate_npm_lockfile_hash", lambda _root: True)
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: tmp_path)
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+    monkeypatch.setattr(
+        hm,
+        "_run_npm_install_deterministic",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0),
+    )
+    monkeypatch.setattr(hm, "_photon_sidecar_dependencies_ready", lambda _sidecar: False)
+    recorded = []
+    monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda root: recorded.append(root))
+
+    assert hm._update_node_dependencies() == ["Photon sidecar"]
+    assert recorded == []
+
+
+def test_update_node_dependencies_treats_photon_detection_error_as_configured(
+    tmp_path, monkeypatch
+):
+    """Detection uncertainty must block a restart after sidecar sync failure."""
+    from hermes_cli import main as hm
+
+    sidecar = tmp_path / "plugins" / "platforms" / "photon" / "sidecar"
+    sidecar.mkdir(parents=True)
+    (tmp_path / "package.json").write_text("{}\n")
+    (sidecar / "package.json").write_text("{}\n")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda env: env)
+
+    def detection_error():
+        raise OSError("profile state unavailable")
+
+    def failed_sidecar(npm, cwd, **kwargs):
+        return subprocess.CompletedProcess(
+            [npm], 1 if cwd == sidecar else 0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(hm, "_photon_configured", detection_error)
+    monkeypatch.setattr(hm, "_run_npm_install_deterministic", failed_sidecar)
+
+    assert hm._update_node_dependencies() == ["Photon sidecar"]
+
+
+def test_zip_update_configured_sidecar_failure_suppresses_windows_gateway_resume(tmp_path, monkeypatch):
+    """ZIP sidecar failure must cancel both direct and atexit gateway resume."""
+    import atexit
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    def configured_sidecar_failure(args, resume_token):
+        resume_token["unsafe_mutation_started"] = True
+        raise SystemExit("Photon sidecar dependencies are not ready")
+
+    monkeypatch.setattr(hm, "_update_via_zip", configured_sidecar_failure)
+
+    with pytest.raises(SystemExit, match="Photon sidecar dependencies are not ready"):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+
+def test_zip_pre_mutation_failure_resumes_windows_gateway(monkeypatch):
+    from hermes_cli import main as hm
+
+    token = {"resume_needed": True}
+    resumed = []
+    suppressed = []
+    monkeypatch.setattr(
+        hm,
+        "_update_via_zip",
+        lambda args, resume_token: (_ for _ in ()).throw(SystemExit(1)),
+    )
+    monkeypatch.setattr(
+        hm, "_resume_windows_gateways_after_update", lambda state: resumed.append(state)
+    )
+    monkeypatch.setattr(
+        hm, "_suppress_windows_gateway_resume", lambda state: suppressed.append(state)
+    )
+
+    with pytest.raises(SystemExit):
+        hm._run_update_via_zip(SimpleNamespace(), token)
+
+    assert resumed == [token]
+    assert suppressed == []
+
+
+def test_git_fetch_failure_resumes_windows_gateway(tmp_path, monkeypatch):
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    token = {"resume_needed": True}
+    resumed = []
+    suppressed = []
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+    monkeypatch.setattr(atexit, "register", lambda *args: None)
+    monkeypatch.setattr(
+        hm, "_resume_windows_gateways_after_update", lambda state: resumed.append(state)
+    )
+    monkeypatch.setattr(
+        hm, "_suppress_windows_gateway_resume", lambda state: suppressed.append(state)
+    )
+
+    def fail_fetch(cmd, **kwargs):
+        if "fetch" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="network down")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(hm.subprocess, "run", fail_fetch)
+
+    with pytest.raises(SystemExit):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert resumed == [token]
+    assert suppressed == []
+
+
+def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path, monkeypatch):
+    """Normal Windows updates must not revive the gateway after sidecar failure."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(
+        hm, "_update_node_dependencies", lambda *_args: ["Photon sidecar"]
+    )
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+    monkeypatch.setattr(hm.subprocess, "run", _make_run_side_effect(commit_count="1"))
+
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(SystemExit) as exc_info:
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert exc_info.value.code == 1
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+def test_windows_update_exception_suppresses_gateway_resume(tmp_path, monkeypatch):
+    """Unexpected update failures must leave the paused gateway down."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm.subprocess, "run", _make_run_side_effect(commit_count="1"))
+
+    def interrupted_update(*_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hm, "_update_node_dependencies", interrupted_update)
+    registered = []
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda func, *args: registered.append((func, args)))
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(KeyboardInterrupt):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert registered
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+
+def test_windows_interrupted_pull_suppresses_gateway_resume(tmp_path, monkeypatch):
+    """An interrupt may leave git mid-mutation, so never revive the gateway."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    base_run = _make_run_side_effect(commit_count="1")
+
+    def interrupted_pull(cmd, **kwargs):
+        if "pull" in cmd:
+            raise KeyboardInterrupt
+        return base_run(cmd, **kwargs)
+
+    monkeypatch.setattr(hm.subprocess, "run", interrupted_pull)
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda *args: None)
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(KeyboardInterrupt):
+        hm._cmd_update_impl(SimpleNamespace(force=True), gateway_mode=False)
+
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+
+@pytest.mark.parametrize("failure", ["checkout", "stash"])
+def test_windows_failed_noop_restoration_suppresses_gateway_resume(
+    tmp_path, monkeypatch, failure
+):
+    """Never restart when no-op checkout/stash restoration is uncertain."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(
+        hm, "_stash_local_changes_if_needed", lambda *args, **kwargs: "stash-sha"
+    )
+    if failure == "stash":
+        def _failed_stash_restore(*args, **kwargs):
+            raise OSError("restore unavailable")
+
+        monkeypatch.setattr(hm, "_restore_stashed_changes", _failed_stash_restore)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    base_run = _make_run_side_effect(branch="fix/local", commit_count="0")
+    switched = False
+
+    def failed_recovery(cmd, **kwargs):
+        nonlocal switched
+        if cmd == ["git", "checkout", "main"]:
+            switched = True
+        if failure == "checkout" and switched and cmd == ["git", "checkout", "fix/local"]:
+            raise OSError("restore unavailable")
+        return base_run(cmd, **kwargs)
+
+    monkeypatch.setattr(hm.subprocess, "run", failed_recovery)
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda *args: None)
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(OSError, match="restore unavailable"):
+        hm._cmd_update_impl(
+            SimpleNamespace(force=True, branch="main"), gateway_mode=False
+        )
+
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+
+@pytest.mark.parametrize("current_branch", ["main", "fix/local"])
+@pytest.mark.parametrize("failure", ["interrupt", "called-process"])
+def test_windows_autostash_failure_never_resumes_or_uses_zip(
+    tmp_path, monkeypatch, current_branch, failure
+):
+    """An interrupted stash may have mutated the worktree; fail closed."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm.sys, "platform", "win32")
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    monkeypatch.setattr(
+        hm.subprocess,
+        "run",
+        _make_run_side_effect(branch=current_branch, commit_count="1"),
+    )
+    error = (
+        KeyboardInterrupt()
+        if failure == "interrupt"
+        else subprocess.CalledProcessError(1, ["git", "stash", "push"])
+    )
+
+    def failed_stash(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(hm, "_stash_local_changes_if_needed", failed_stash)
+    zip_calls = []
+    monkeypatch.setattr(hm, "_run_update_via_zip", lambda *args: zip_calls.append(args))
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda *args: None)
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(type(error)):
+        hm._cmd_update_impl(
+            SimpleNamespace(force=True, branch="main"), gateway_mode=False
+        )
+
+    assert zip_calls == []
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
+
+
+def test_windows_failed_noop_venv_repair_keeps_gateway_stopped(tmp_path, monkeypatch):
+    """Never resume a paused gateway against a post-repair unhealthy venv."""
+    import atexit
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: None)
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hm, "_stash_local_changes_if_needed", lambda *args: None)
+    monkeypatch.setattr(
+        hm.subprocess,
+        "run",
+        _make_run_side_effect(branch="main", commit_count="0"),
+    )
+    health = iter([(False, "broken imports"), (False, "still broken")])
+    monkeypatch.setattr(hm, "_venv_core_imports_healthy", lambda: next(health))
+    monkeypatch.setattr(
+        hm, "_install_python_dependencies_with_optional_fallback", lambda *args, **kwargs: None
+    )
+    marker_events = []
+    monkeypatch.setattr(hm, "_write_update_incomplete_marker", lambda: marker_events.append("write"))
+    monkeypatch.setattr(hm, "_clear_update_incomplete_marker", lambda: marker_events.append("clear"))
+    token = {"resume_needed": True}
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
+    unregistered = []
+    monkeypatch.setattr(atexit, "register", lambda *args: None)
+    monkeypatch.setattr(atexit, "unregister", lambda func: unregistered.append(func))
+
+    with pytest.raises(SystemExit) as exc:
+        hm._cmd_update_impl(
+            SimpleNamespace(force=True, branch="main"), gateway_mode=False
+        )
+
+    assert exc.value.code == 1
+    assert marker_events == ["write"]
+    assert unregistered == [hm._resume_windows_gateways_after_update]
+    assert token["resume_needed"] is False
