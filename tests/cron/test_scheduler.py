@@ -516,7 +516,6 @@ class TestRoutingIntents:
                     "FEISHU_HOME_CHANNEL", "WECOM_HOME_CHANNEL", "WEIXIN_HOME_CHANNEL",
                     "BLUEBUBBLES_HOME_CHANNEL", "QQBOT_HOME_CHANNEL", "QQ_HOME_CHANNEL"):
             monkeypatch.delenv(var, raising=False)
-
         assert _resolve_delivery_targets({"deliver": "all", "origin": None}) == []
 
     def test_origin_comma_all_preserves_origin_first(self, monkeypatch):
