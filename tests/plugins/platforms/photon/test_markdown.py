@@ -121,9 +121,52 @@ async def test_standalone_send_includes_markdown_format(
             return _Resp()
 
     monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _FakeClient)
-
     cfg = PlatformConfig(enabled=True, token="", extra={})
-    result = await photon_adapter._standalone_send(cfg, "+15551234567", _MD)
+    result = await photon_adapter._standalone_send(cfg, "+155****4567", _MD)
 
     assert result.get("success") is True
     assert posted[0][1]["format"] == "markdown"
+
+
+@pytest.mark.asyncio
+async def test_standalone_send_routes_bare_mp3_as_voice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unflagged audio must still hit sidecar voice/M4A conversion."""
+    monkeypatch.setenv("PHOTON_SIDECAR_TOKEN", "tok")
+    posted: List[Tuple[str, Dict[str, Any]]] = []
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json() -> Dict[str, Any]:
+            return {"ok": True, "messageId": "m-10"}
+
+    class _FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url: str, json: Dict[str, Any], headers=None):
+            posted.append((url, json))
+            return _Resp()
+
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _FakeClient)
+    monkeypatch.setattr(
+        photon_adapter.BasePlatformAdapter,
+        "validate_media_delivery_path",
+        staticmethod(lambda path: path),
+    )
+    cfg = PlatformConfig(enabled=True, token="", extra={})
+    result = await photon_adapter._standalone_send(
+        cfg, "+155****4567", "", media_files=[("/tmp/reply.mp3", False)]
+    )
+
+    assert result.get("success") is True
+    assert posted[0][1]["kind"] == "voice"
