@@ -26,11 +26,18 @@ import subprocess
 import sys
 import tarfile
 import venv
+import zipfile
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PHOTON_SIDECAR_RUNTIME = {
+    "index.mjs",
+    "package-lock.json",
+    "package.json",
+    "patch-spectrum-mixed-attachments.mjs",
+}
 
 
 @pytest.mark.integration
@@ -49,6 +56,16 @@ def test_installed_wheel_renders_i18n_strings(tmp_path):
     wheels = glob.glob(str(wheel_dir / "*.whl"))
     assert wheels, "no wheel produced"
     wheel = wheels[0]
+
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+    expected_sidecar = {
+        f"plugins/platforms/photon/sidecar/{name}"
+        for name in PHOTON_SIDECAR_RUNTIME
+    }
+    assert expected_sidecar <= names, (
+        f"wheel missing Photon sidecar runtime files: {sorted(expected_sidecar - names)}"
+    )
 
     # 2. Fresh venv, install the wheel WITHOUT deps (we only exercise i18n,
     #    which needs pyyaml). --force-reinstall guards against pip's
@@ -117,9 +134,19 @@ def test_built_sdist_ships_locale_catalogs(tmp_path):
     assert tarballs, "no sdist produced"
 
     with tarfile.open(tarballs[0]) as tf:
+        names = tf.getnames()
         # Members are prefixed with the sdist root dir, e.g.
         # hermes_agent-0.15.1/locales/en.yaml — match on the suffix.
-        catalogs = [m for m in tf.getnames() if "/locales/" in m and m.endswith(".yaml")]
+        catalogs = [m for m in names if "/locales/" in m and m.endswith(".yaml")]
+
+    missing_sidecar = {
+        name
+        for name in PHOTON_SIDECAR_RUNTIME
+        if not any(m.endswith(f"/plugins/platforms/photon/sidecar/{name}") for m in names)
+    }
+    assert not missing_sidecar, (
+        f"sdist missing Photon sidecar runtime files: {sorted(missing_sidecar)}"
+    )
 
     # Compare against the canonical language list rather than a hardcoded floor
     # so adding/removing a catalog updates the guard automatically and a dropped
