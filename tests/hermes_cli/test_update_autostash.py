@@ -556,6 +556,7 @@ def _make_update_side_effect(
     head_sha="abc123def456",
     mirror_sha=None,
     archive_collisions=0,
+    push_url=None,
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
@@ -578,6 +579,13 @@ def _make_update_side_effect(
                 stdout=f"{push_remote}\n" if push_remote else "",
                 stderr="",
                 returncode=0 if push_remote else 1,
+            )
+        if cmd[1:5] == ["remote", "get-url", "--push", "--all"]:
+            destination = push_url or push_remote
+            return SimpleNamespace(
+                stdout=f"{destination}\n" if destination else "",
+                stderr="",
+                returncode=0 if destination else 2,
             )
         if "ls-remote" in joined:
             remote_ref = str(cmd[-1])
@@ -1213,6 +1221,88 @@ def test_cmd_update_non_default_branch_uses_its_remote_and_ref(monkeypatch, tmp_
         "qa-fork",
         "HEAD:refs/heads/release-candidate",
     ] in recorded
+
+
+def test_update_archive_observes_and_pushes_to_configured_push_url(
+    monkeypatch, tmp_path
+):
+    """A distinct fetch URL cannot supply the lease for the push destination."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True,
+        local_commit_count="2",
+        push_remote="fork",
+        push_url="ssh://push.example/hermes.git",
+        mirror_sha="push-before",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    push_observations = [cmd for cmd in recorded if "ls-remote" in cmd]
+    assert push_observations
+    assert all(cmd[-2] == "ssh://push.example/hermes.git" for cmd in push_observations)
+    push_calls = [cmd for cmd in recorded if "push" in cmd]
+    assert push_calls
+    assert all("ssh://push.example/hermes.git" in cmd for cmd in push_calls)
+
+
+def test_push_destination_resolution_uses_pushurl_and_rejects_multiple(tmp_path):
+    """Real Git config resolves pushurl, while ambiguous fan-out fails closed."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    work = tmp_path / "work"
+    fetch_remote = tmp_path / "fetch.git"
+    push_remote = tmp_path / "push.git"
+    second_push_remote = tmp_path / "push-2.git"
+    for bare in (fetch_remote, push_remote, second_push_remote):
+        subprocess.run(["git", "init", "--bare", "-q", bare], check=True)
+    subprocess.run(["git", "init", "-q", work], check=True)
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=work, capture_output=True, text=True, check=True
+        )
+
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (work / "tracked.txt").write_text("fetch\n")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "fetch head")
+    fetch_sha = git("rev-parse", "HEAD").stdout.strip()
+    git("push", str(fetch_remote), "HEAD:refs/heads/main")
+
+    (work / "tracked.txt").write_text("push\n")
+    git("commit", "-qam", "push head")
+    push_sha = git("rev-parse", "HEAD").stdout.strip()
+    git("push", str(push_remote), "HEAD:refs/heads/main")
+    git("remote", "add", "fork", str(fetch_remote))
+    git("config", "--add", "remote.fork.pushurl", str(push_remote))
+
+    destination, error = hermes_main._resolve_single_push_destination(
+        ["git"], work, "fork"
+    )
+    assert error == ""
+    assert destination == str(push_remote)
+    observed, observed_sha, error = hermes_main._observe_remote_branch(
+        ["git"], work, destination, "main"
+    )
+    assert (observed, observed_sha, error) == (True, push_sha, "")
+    assert observed_sha != fetch_sha
+
+    git("config", "--add", "remote.fork.pushurl", str(second_push_remote))
+    destination, error = hermes_main._resolve_single_push_destination(
+        ["git"], work, "fork"
+    )
+    assert destination is None
+    assert "exactly one push URL; found 2" in error
 
 
 def test_cmd_update_validates_syntax_before_mirroring_rebased_history(
