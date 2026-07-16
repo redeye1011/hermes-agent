@@ -4729,16 +4729,16 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
 
 
 def _observe_remote_branch(
-    git_cmd, cwd, remote: str, branch: str
+    git_cmd, cwd, destination: str, branch: str
 ) -> tuple[bool, str | None, str]:
-    """Authoritatively read ``remote/branch`` without trusting tracking refs.
+    """Authoritatively read ``destination/branch`` without tracking refs.
 
     ``(True, None, "")`` means the branch was confirmed absent. A failed
     ``ls-remote`` returns ``(False, None, stderr)`` so callers never confuse a
     network/authentication failure with absence.
     """
     result = subprocess.run(
-        git_cmd + ["ls-remote", "--heads", remote, f"refs/heads/{branch}"],
+        git_cmd + ["ls-remote", "--heads", destination, f"refs/heads/{branch}"],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -4752,6 +4752,27 @@ def _observe_remote_branch(
     return (True, sha, "") if sha else (False, None, "invalid ls-remote output")
 
 
+def _resolve_single_push_destination(
+    git_cmd, cwd, remote: str
+) -> tuple[str | None, str]:
+    """Resolve exactly one push URL so observation and mutation cannot diverge."""
+    result = subprocess.run(
+        git_cmd + ["remote", "get-url", "--push", "--all", remote],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None, result.stderr.strip()
+    destinations = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(destinations) != 1:
+        return (
+            None,
+            f"remote '{remote}' must have exactly one push URL; found {len(destinations)}",
+        )
+    return destinations[0], ""
+
+
 def _update_archive_ref(branch: str, backup_sha: str, attempt: int = 0) -> str:
     """Build a readable, unique namespace for a pre-rebase commit archive."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -4761,14 +4782,14 @@ def _update_archive_ref(branch: str, backup_sha: str, attempt: int = 0) -> str:
 
 
 def _select_update_archive_ref(
-    git_cmd, cwd, remote: str, branch: str, backup_sha: str
+    git_cmd, cwd, destination: str, branch: str, backup_sha: str
 ) -> tuple[str | None, str]:
     """Choose an archive ref confirmed absent on the destination remote."""
     for attempt in range(100):
         archive_ref = _update_archive_ref(branch, backup_sha, attempt)
         archive_branch = archive_ref.removeprefix("refs/heads/")
         observed, existing_sha, error = _observe_remote_branch(
-            git_cmd, cwd, remote, archive_branch
+            git_cmd, cwd, destination, archive_branch
         )
         if not observed:
             return None, error
@@ -11396,6 +11417,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         rebase_push_remote: Optional[str] = None
+        rebase_push_destination: Optional[str] = None
         rebase_backup_sha: Optional[str] = None
         rebase_archive_ref: Optional[str] = None
         rebase_mirror_sha: Optional[str] = None
@@ -11476,8 +11498,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _restore_checkout_after_safe_failure()
                         sys.exit(1)
 
+                    push_destination, push_destination_error = (
+                        _resolve_single_push_destination(
+                            git_cmd, PROJECT_ROOT, push_remote
+                        )
+                    )
+                    if not push_destination:
+                        print(
+                            f"✗ Could not resolve a single push destination for "
+                            f"'{push_remote}'; update stopped before rebase."
+                        )
+                        if push_destination_error:
+                            print(f"  {push_destination_error}")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
                     mirror_observed, mirror_sha, mirror_error = _observe_remote_branch(
-                        git_cmd, PROJECT_ROOT, push_remote, branch
+                        git_cmd, PROJECT_ROOT, push_destination, branch
                     )
                     if not mirror_observed:
                         print(
@@ -11489,7 +11526,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         sys.exit(1)
 
                     archive_ref, archive_error = _select_update_archive_ref(
-                        git_cmd, PROJECT_ROOT, push_remote, branch, backup_sha
+                        git_cmd, PROJECT_ROOT, push_destination, branch, backup_sha
                     )
                     if not archive_ref:
                         print(
@@ -11511,7 +11548,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         + [
                             "push",
                             f"--force-with-lease={archive_ref}:",
-                            push_remote,
+                            push_destination,
                             f"{backup_sha}:{archive_ref}",
                         ],
                         cwd=PROJECT_ROOT,
@@ -11530,7 +11567,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         sys.exit(1)
 
                     print(f"  ✓ Archive created: {push_remote}/{archive_label}")
-                    print(f"    Recover with: git fetch {push_remote} {archive_ref}")
+                    print(
+                        "    Recover with: git fetch "
+                        f'"$(git remote get-url --push {push_remote})" {archive_ref}'
+                    )
 
                     print(f"  → Rebasing local commits onto origin/{branch}...")
                     _mark_update_unsafe()
@@ -11568,6 +11608,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # syntax validation passes. The explicit lease below then
                     # prevents overwriting a concurrent remote update.
                     rebase_push_remote = push_remote
+                    rebase_push_destination = push_destination
                     rebase_backup_sha = backup_sha
                     rebase_archive_ref = archive_ref
                     rebase_mirror_sha = mirror_sha
@@ -11636,7 +11677,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
 
-            if rebase_push_remote and rebase_backup_sha and rebase_archive_ref:
+            if (
+                rebase_push_remote
+                and rebase_push_destination
+                and rebase_backup_sha
+                and rebase_archive_ref
+            ):
                 mirror_lease = (
                     f"--force-with-lease=refs/heads/{branch}:{rebase_mirror_sha or ''}"
                 )
@@ -11645,7 +11691,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     + [
                         "push",
                         mirror_lease,
-                        rebase_push_remote,
+                        rebase_push_destination,
                         f"HEAD:refs/heads/{branch}",
                     ],
                     cwd=PROJECT_ROOT,
