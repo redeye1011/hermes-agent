@@ -124,6 +124,45 @@ async def test_reap_raises_for_foreign_listener(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["ffmpeg", "patch-markers"])
+async def test_start_sidecar_fails_closed_on_runtime_corruption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+
+    async def _no_reap() -> None:
+        pass
+
+    monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
+    monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
+    modules = tmp_path / "node_modules"
+    ffmpeg = modules / "ffmpeg-static" / (
+        "ffmpeg.exe" if photon_adapter.sys.platform == "win32" else "ffmpeg"
+    )
+    imessage = modules / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+    for path in (modules / "ffmpeg-static" / "index.js", ffmpeg, imessage):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+    monkeypatch.setattr(photon_adapter, "_sidecar_deps_stale", lambda: False)
+
+    class _Result:
+        stdout = ""
+        stderr = ""
+
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    monkeypatch.setattr(
+        photon_adapter.subprocess,
+        "run",
+        lambda cmd, **kwargs: _Result(1 if failure == "ffmpeg" and "-version" in cmd else 0),
+    )
+
+    with pytest.raises(RuntimeError, match="ffmpeg runtime|patch markers"):
+        await adapter._start_sidecar()
+
+
+@pytest.mark.asyncio
 async def test_start_sidecar_spawns_with_stdin_pipe(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -134,8 +173,30 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
         pass
 
     monkeypatch.setattr(adapter, "_reap_stale_sidecar", _no_reap)
-    (tmp_path / "node_modules").mkdir()
     monkeypatch.setattr(photon_adapter, "_SIDECAR_DIR", tmp_path)
+    installs = []
+
+    def _install() -> None:
+        installs.append(True)
+        modules = tmp_path / "node_modules" / "ffmpeg-static"
+        modules.mkdir(parents=True)
+        (modules / "index.js").write_text("")
+        (modules / ("ffmpeg.exe" if photon_adapter.sys.platform == "win32" else "ffmpeg")).write_text("")
+        imessage = (
+            tmp_path
+            / "node_modules"
+            / "@spectrum-ts"
+            / "imessage"
+            / "dist"
+            / "index.js"
+        )
+        imessage.parent.mkdir(parents=True)
+        imessage.write_text(
+            "Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
+
+    monkeypatch.setattr(photon_adapter, "_reinstall_sidecar_deps", _install)
 
     spawned: Dict[str, Any] = {}
     hidden_flags = 0x08000000
@@ -184,6 +245,7 @@ async def test_start_sidecar_spawns_with_stdin_pipe(
     await adapter._start_sidecar()
 
     kwargs = spawned["kwargs"]
+    assert installs == [True]
     assert kwargs["stdin"] is subprocess.PIPE
     assert kwargs["env"]["PHOTON_SIDECAR_WATCH_STDIN"] == "1"
     assert spawned["patch_kwargs"]["creationflags"] == hidden_flags
