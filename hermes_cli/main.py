@@ -4894,34 +4894,31 @@ def _run_npm_install_deterministic(
     # install path and nix/lib.nix npm ci hooks.
     run_env = {**os.environ, **(env or {}), "CI": "1"}
 
+    def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=run_env,
+                capture_output=capture_output,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
+
     lockfile = cwd / "package-lock.json"
     if lockfile.exists():
         ci_cmd = [npm, "ci", "--include=dev", *extra_args]
-        ci_result = subprocess.run(
-            ci_cmd,
-            cwd=cwd,
-            env=run_env,
-            capture_output=capture_output,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        ci_result = _run(ci_cmd)
         if ci_result.returncode == 0:
             return ci_result
         # Fall through to `npm install` — lockfile may be out of sync on a
         # WIP fork/branch, or `npm ci` may not be available on very old npm.
     install_cmd = [npm, "install", "--no-save", "--include=dev", *extra_args]
-    return subprocess.run(
-        install_cmd,
-        cwd=cwd,
-        env=run_env,
-        capture_output=capture_output,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    return _run(install_cmd)
 
 
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
@@ -6315,7 +6312,7 @@ def _atomic_replace_dir(src: str, dst: str) -> None:
         shutil.rmtree(backup, ignore_errors=True)
 
 
-def _update_via_zip(args):
+def _update_via_zip(args, windows_gateway_resume: dict | None = None):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -6394,12 +6391,15 @@ def _update_via_zip(args):
         # Copy updated files over existing installation, preserving venv/node_modules/.git
         preserve = {"venv", "node_modules", ".git", ".env"}
         update_count = 0
-        for item in os.listdir(extracted):
+        extracted_items = os.listdir(extracted)
+        for item in extracted_items:
             if item in preserve:
                 continue
             src = os.path.join(extracted, item)
             dst = os.path.join(str(PROJECT_ROOT), item)
-            if os.path.isdir(src):
+            src_is_dir = os.path.isdir(src)
+            _mark_windows_gateway_update_unsafe(windows_gateway_resume)
+            if src_is_dir:
                 # Atomic-ish replace: never leave dst half-deleted if the copy
                 # fails partway (the failure mode behind #49145 on Windows).
                 _atomic_replace_dir(src, dst)
@@ -6464,6 +6464,13 @@ def _update_via_zip(args):
         _install_python_dependencies_with_optional_fallback(pip_cmd)
 
     node_failures = _update_node_dependencies()
+    if "Photon sidecar" in node_failures:
+        print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+        print(
+            "  The gateway was not restarted. Fix npm/the sidecar install, "
+            "then rerun `hermes update`."
+        )
+        sys.exit(1)
     _build_web_ui(PROJECT_ROOT / "web")
 
     # Sync skills
@@ -6527,6 +6534,20 @@ def _update_via_zip(args):
         print("    Node.js dependency refresh did not complete.")
     else:
         _kill_stale_dashboard_processes()
+
+
+def _run_update_via_zip(args, windows_gateway_resume: dict | None) -> None:
+    """Run the ZIP updater without reviving gateways after a failed update."""
+    try:
+        _update_via_zip(args, windows_gateway_resume)
+    except BaseException:
+        _handle_windows_gateway_update_failure(windows_gateway_resume)
+        raise
+    _resume_windows_gateways_after_update(windows_gateway_resume)
+    if windows_gateway_resume:
+        import atexit
+
+        atexit.unregister(_resume_windows_gateways_after_update)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -8215,7 +8236,9 @@ def _npm_manifest_paths() -> tuple[Path, ...]:
 
     The workspace list is pulled from the root package.json's `workspaces`
     globs (npm's own source of truth) rather than hardcoded, so adding a
-    workspace can never silently escape the skip key. The root install
+    workspace can never silently escape the skip key. Photon owns a separate
+    lockfile outside those workspaces, so its manifests are included too. The
+    root install
     (step 1, --workspaces=false) still hoists shared deps for EVERY
     workspace — desktop included — so all of them belong in the key, not
     just the ones step 2 installs. Falls back to hashing just root
@@ -8237,6 +8260,12 @@ def _npm_manifest_paths() -> tuple[Path, ...]:
                     paths.append(manifest)
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    paths.extend(
+        path
+        for path in (photon_sidecar / "package-lock.json", photon_sidecar / "package.json")
+        if path.is_file()
+    )
     return tuple(paths)
 
 
@@ -8257,6 +8286,92 @@ def _npm_manifests_digest() -> str | None:
     return h.hexdigest()
 
 
+def _npm_lockfile_cache_file(hermes_root: Path) -> Path:
+    cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
+    return hermes_root / f".npm_lock_hash_{cache_key}"
+
+
+def _invalidate_npm_lockfile_hash(hermes_root: Path) -> bool:
+    try:
+        _npm_lockfile_cache_file(hermes_root).unlink(missing_ok=True)
+        return True
+    except OSError:
+        logger.debug("Could not invalidate npm lockfile hash cache")
+        return False
+
+
+def _photon_sidecar_runtime_probe(sidecar: Path) -> bool:
+    """Resolve the sidecar's real runtime imports with the managed Node binary."""
+    from hermes_constants import find_node_executable, with_hermes_node_path
+
+    node = find_node_executable("node")
+    if not node:
+        return False
+    script = """
+import { spawnSync } from 'node:child_process';
+await import('spectrum-ts');
+await import('@spectrum-ts/imessage');
+let ffmpeg = 'ffmpeg';
+try { ffmpeg = (await import('ffmpeg-static')).default || ffmpeg; } catch {}
+let probe = spawnSync(ffmpeg, ['-version'], {stdio: 'ignore'});
+if (probe.status !== 0 && ffmpeg !== 'ffmpeg') {
+  probe = spawnSync('ffmpeg', ['-version'], {stdio: 'ignore'});
+}
+if (probe.status !== 0) process.exit(1);
+"""
+    try:
+        result = subprocess.run(
+            [node, "--input-type=module", "--eval", script],
+            cwd=sidecar,
+            env=with_hermes_node_path(os.environ.copy()),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _photon_sidecar_dependencies_ready(sidecar: Path) -> bool:
+    """Verify the locked Photon runtime, generated ffmpeg binary, and Spectrum patch."""
+    modules = sidecar / "node_modules"
+    try:
+        expected = json.loads((sidecar / "package-lock.json").read_text(encoding="utf-8"))
+        installed = json.loads(
+            (modules / ".package-lock.json").read_text(encoding="utf-8")
+        )
+        installed_packages = installed.get("packages", {})
+        for relative, metadata in expected.get("packages", {}).items():
+            if not relative.startswith("node_modules/") or metadata.get("optional"):
+                continue
+            actual = installed_packages.get(relative)
+            if not actual or not (sidecar / relative).is_dir():
+                return False
+            if metadata.get("version") != actual.get("version"):
+                return False
+
+        imessage = modules / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+        required = (
+            modules / "spectrum-ts" / "dist" / "index.js",
+            imessage,
+        )
+        if not all(path.is_file() for path in required):
+            return False
+        patched = imessage.read_text(encoding="utf-8")
+        patch_ready = all(
+            marker in patched
+            for marker in (
+                "Hermes patch: Preserve mixed text + attachment iMessage payloads",
+                "Hermes patch: Hydrate placeholder-only iMessage attachments v2",
+            )
+        )
+        return patch_ready and _photon_sidecar_runtime_probe(sidecar)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        return False
+
+
 def _npm_lockfile_changed(hermes_root: Path) -> bool:
     current = _npm_manifests_digest()
     if current is None:
@@ -8265,10 +8380,14 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     # node_modules means the cache was recorded by another checkout.
     if not (PROJECT_ROOT / "node_modules").is_dir():
         return True
+    photon_sidecar = PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    if (photon_sidecar / "package.json").is_file() and not _photon_sidecar_dependencies_ready(
+        photon_sidecar
+    ):
+        return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
-        cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
+        cache_file = _npm_lockfile_cache_file(hermes_root)
         if not cache_file.exists():
             return True
         return cache_file.read_text(encoding="utf-8").strip() != current
@@ -8281,9 +8400,7 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     if digest is None:
         return
     try:
-        cache_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
-        cache_file = hermes_root / f".npm_lock_hash_{cache_key}"
-        cache_file.write_text(digest, encoding="utf-8")
+        _npm_lockfile_cache_file(hermes_root).write_text(digest, encoding="utf-8")
     except OSError:
         logger.debug("Could not write npm lockfile hash cache")
 
@@ -8308,34 +8425,16 @@ def _is_windows_npm_path(npm_path: str) -> bool:
 
 
 def _resolve_node_runtime_npm() -> str | None:
-    """Resolve an npm executable that belongs to the host's Node runtime.
-
-    On WSL/Linux ``shutil.which("npm")`` may resolve a Windows npm exposed
-    through PATH interop. Running that Windows npm against the Linux checkout
-    operates over ``\\wsl.localhost\\...`` UNC paths and fails with EISDIR /
-    symlink errors in symlink-heavy trees like ``ui-tui`` (#30271). Refuse a
-    Windows npm on a POSIX host and re-scan PATH (skipping ``/mnt/*`` interop
-    entries) for a Linux-native npm. Returns the npm path, or ``None`` when
-    no suitable npm is reachable.
-    """
+    """Resolve an npm executable that belongs to the host's Node runtime."""
     from hermes_constants import find_node_executable
 
     npm = find_node_executable("npm")
-
-    # On native Windows the platform npm (``npm.cmd``) is exactly what we
-    # want — only reject Windows shims when we're a POSIX/WSL process.
     if _is_windows():
         return npm
-
     if not npm:
         return None
-
     if not _is_windows_npm_path(npm):
         return npm
-
-    # The first resolution was a Windows npm. Re-scan PATH skipping the
-    # ``/mnt/*`` Windows drive mounts WSL injects, so a Linux-native npm that
-    # came later on PATH is still found.
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         if not directory or directory.lower().startswith("/mnt/"):
             continue
@@ -8345,111 +8444,185 @@ def _resolve_node_runtime_npm() -> str | None:
     return None
 
 
-def _update_node_dependencies() -> list[str]:
-    """Refresh Node deps in the repo root and update workspaces.
+def _photon_configured() -> bool:
+    """Return whether any Hermes profile has usable Photon credentials."""
+    from agent.secret_scope import build_profile_secret_scope
+    from gateway.config import Platform, load_gateway_config
+    from hermes_cli.profiles import list_profiles
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from plugins.platforms.photon.adapter import validate_config
+    from plugins.platforms.photon.auth import load_project_credentials
+    import yaml
 
-    Returns the list of labels whose npm install failed (empty on success),
-    so the caller can treat a Node refresh failure as a partial update rather
-    than silently reporting ``Update complete!`` (#30271).
-    """
+    homes = [Path(get_hermes_home())]
+    try:
+        homes.extend(profile.path for profile in list_profiles())
+    except Exception:
+        return True
+
+    for home in dict.fromkeys(homes):
+        try:
+            env_path = home / ".env"
+            if env_path.exists():
+                env_path.read_text(encoding="utf-8")
+            for filename in ("auth.json", "gateway.json"):
+                source = home / filename
+                if source.exists():
+                    json.loads(source.read_text(encoding="utf-8"))
+            config_path = home / "config.yaml"
+            if config_path.exists():
+                yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError):
+            return True
+
+        secrets = build_profile_secret_scope(home)
+        if secrets.get("PHOTON_PROJECT_ID") and secrets.get("PHOTON_PROJECT_SECRET"):
+            return True
+
+        token = set_hermes_home_override(str(home))
+        try:
+            project_id, project_secret = load_project_credentials()
+            if project_id and project_secret:
+                return True
+            photon = load_gateway_config().platforms.get(Platform("photon"))
+            if photon and validate_config(photon):
+                return True
+        except Exception:
+            return True
+        finally:
+            reset_hermes_home_override(token)
+    return False
+
+
+def _update_node_dependencies(windows_gateway_resume: dict | None = None) -> list[str]:
+    """Refresh root/workspace deps and the independently locked Photon sidecar."""
     if not (PROJECT_ROOT / "package.json").exists():
         return []
 
+    photon_sidecar = (
+        PROJECT_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+    )
+    try:
+        photon_configured = _photon_configured()
+    except Exception:
+        photon_configured = True
+
     npm = _resolve_node_runtime_npm()
     if not npm:
-        # If the only npm reachable inside this WSL shell is the Windows one,
-        # flag it loudly: silently skipping leaves ui-tui deps stale while the
-        # rest of the update proceeds, and running it would corrupt the tree.
+        failures: list[str] = []
         from hermes_constants import is_wsl
 
         path_npm = shutil.which("npm")
         if is_wsl() and path_npm and _is_windows_npm_path(path_npm):
             print("→ Updating Node.js dependencies...")
             print("  ⚠ Skipped: only a Windows npm is reachable from this WSL shell.")
-            print("    Install Node.js inside the WSL distro (nvm, or your distro's")
-            print("    package manager), then re-run `hermes update`.")
-            failed = ["repo root"]
+            print("    Install Node.js inside the WSL distro, then re-run `hermes update`.")
+            failures.append("repo root")
             if any(
                 (PROJECT_ROOT / workspace / "package.json").exists()
                 for workspace in ("ui-tui", "web")
             ):
-                failed.append("ui-tui, web workspaces")
-            return failed
-        return []
+                failures.append("ui-tui, web workspaces")
+        if photon_configured and (photon_sidecar / "package.json").exists():
+            print("  ⚠ Photon sidecar dependencies could not be checked: npm is unavailable")
+            failures.append("Photon sidecar")
+        return failures
 
-    from hermes_constants import get_default_hermes_root
+    from hermes_constants import get_default_hermes_root, with_hermes_node_path
 
-    # This cache describes PROJECT_ROOT/node_modules, which is shared by every
-    # Hermes profile using this checkout. Keep one per-checkout cache under the
-    # shared Hermes root rather than rerunning npm once per named profile.
     shared_hermes_root = get_default_hermes_root()
     if not _npm_lockfile_changed(shared_hermes_root):
         logger.info("npm lockfile unchanged, skipping npm install")
         return []
 
-    # With a single workspace lockfile the root install would cover ALL
-    # workspaces — but apps/desktop pulls in Electron as a devDependency,
-    # and its postinstall downloads a ~200MB binary.  Most users don't
-    # need desktop during `hermes update`, so we install root-only first
-    # then add just the workspaces the CLI/TUI/web build actually requires.
-    # Desktop deps are installed on demand by the desktop launcher
-    # (see _desktop_build_needed).
+    # Do not let a failed partial repair inherit an earlier success marker.
+    if not _invalidate_npm_lockfile_hash(shared_hermes_root):
+        print("  ⚠ Could not invalidate the Node.js dependency cache marker.")
+        print("    Dependency repair was skipped; fix its permissions and retry.")
+        failures = ["repo root"]
+        if photon_configured and (photon_sidecar / "package.json").exists():
+            failures.append("Photon sidecar")
+        return failures
+    _mark_windows_gateway_update_unsafe(windows_gateway_resume)
     print("→ Updating Node.js dependencies...")
-
-    def _partial_update_failure(*labels: str) -> list[str]:
-        print()
-        print("  ⚠ Node.js dependency refresh did not complete cleanly; the")
-        print("    installation may be in a mixed state (updated code, stale Node")
-        print("    deps). Fix npm and re-run `hermes update`.")
-        return list(labels)
-
     extra_args = ["--no-fund", "--no-audit", "--progress=false"]
-
-    from hermes_constants import with_hermes_node_path
-
     nixos_env = with_hermes_node_path(_nixos_build_env())
+    failures = []
 
-    # Step 1: root install (no workspace recursion).
-    # NOTE: capture_output=False here is deliberate (#18840) — optional
-    # postinstall scripts (e.g. @askjo/camofox-browser's browser-binary fetch)
-    # print download progress, and capturing it makes a long download look
-    # hung. The chatty npm-deprecation noise during `hermes update` comes from
-    # the *desktop* build, not this step; that one is captured to update.log.
-    root_args = [*extra_args, "--workspaces=false"]
     root_result = _run_npm_install_deterministic(
         npm,
         PROJECT_ROOT,
-        extra_args=tuple(root_args),
+        extra_args=tuple([*extra_args, "--workspaces=false"]),
         capture_output=False,
         env=nixos_env,
     )
     if root_result.returncode != 0:
+        failures.append("repo root")
         print("  ⚠ npm install failed in repo root")
         stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
         if stderr:
             print(f"    {stderr.splitlines()[-1]}")
-        return _partial_update_failure("repo root")
+    else:
+        workspace_result = _run_npm_install_deterministic(
+            npm,
+            PROJECT_ROOT,
+            extra_args=tuple(
+                [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
+            ),
+            capture_output=False,
+            env=nixos_env,
+        )
+        if workspace_result.returncode == 0:
+            print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
+        else:
+            failures.append("ui-tui, web workspaces")
+            print("  ⚠ npm workspace install failed")
+            stderr = (
+                (workspace_result.stderr or "").strip()
+                if workspace_result.stderr
+                else ""
+            )
+            if stderr:
+                print(f"    {stderr.splitlines()[-1]}")
 
-    # Step 2: install only the workspaces update needs (ui-tui, web).
-    # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
-    ws_result = _run_npm_install_deterministic(
-        npm,
-        PROJECT_ROOT,
-        extra_args=tuple(ws_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if ws_result.returncode == 0:
+    sidecar_ok = True
+    if (photon_sidecar / "package.json").exists():
+        sidecar_result = _run_npm_install_deterministic(
+            npm,
+            photon_sidecar,
+            extra_args=tuple(extra_args),
+            capture_output=False,
+            env=nixos_env,
+        )
+        if sidecar_result.returncode == 0 and _photon_sidecar_dependencies_ready(
+            photon_sidecar
+        ):
+            print("  ✓ Photon sidecar dependencies")
+        else:
+            sidecar_ok = False
+            print("  ⚠ Photon sidecar dependencies are not runtime-ready")
+            stderr = (
+                (sidecar_result.stderr or "").strip()
+                if sidecar_result.stderr
+                else ""
+            )
+            if stderr:
+                print(f"    {stderr.splitlines()[-1]}")
+            if photon_configured:
+                failures.append("Photon sidecar")
+
+    if not failures and sidecar_ok:
         _record_npm_lockfile_hash(shared_hermes_root)
-        print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
-        return []
-
-    print("  ⚠ npm workspace install failed")
-    stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
-    if stderr:
-        print(f"    {stderr.splitlines()[-1]}")
-    return _partial_update_failure("ui-tui, web workspaces")
+    elif failures:
+        print()
+        print("  ⚠ Node.js dependency refresh did not complete cleanly; the")
+        print("    installation may be in a mixed state. Fix npm and re-run")
+        print("    `hermes update`.")
+    return failures
 
 
 class _UpdateOutputStream:
@@ -9603,6 +9776,29 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
         )
 
 
+def _suppress_windows_gateway_resume(token: dict | None) -> None:
+    """Keep paused Windows gateways down after an unsafe update failure."""
+    if not token or not token.get("resume_needed"):
+        return
+    token["resume_needed"] = False
+    import atexit
+
+    atexit.unregister(_resume_windows_gateways_after_update)
+
+
+def _mark_windows_gateway_update_unsafe(token: dict | None) -> None:
+    if token:
+        token["unsafe_mutation_started"] = True
+
+
+def _handle_windows_gateway_update_failure(token: dict | None) -> None:
+    if not token:
+        return
+    if token.get("unsafe_mutation_started"):
+        _suppress_windows_gateway_resume(token)
+    else:
+        _resume_windows_gateways_after_update(token)
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -9911,11 +10107,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
 
     if use_zip_update:
-        # ZIP-based update for Windows when git is broken
-        try:
-            _update_via_zip(args)
-        finally:
-            _resume_windows_gateways_after_update(_windows_gateway_resume)
+        # ZIP-based update for Windows when git is broken. A failed update must
+        # not revive the paused gateway against stale code or dependencies.
+        _run_update_via_zip(args, _windows_gateway_resume)
         return
 
     # Fetch and pull
@@ -9961,6 +10155,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        original_checkout_target = current_branch
+        if current_branch == "HEAD":
+            original_checkout_target = _capture_head_sha(git_cmd, PROJECT_ROOT)
+            if not original_checkout_target:
+                print("✗ Could not capture the detached HEAD commit; update stopped.")
+                sys.exit(1)
+
+        unsafe_operation_started = False
+        mark_gateway_unsafe = _mark_windows_gateway_update_unsafe
+
+        def _mark_update_unsafe() -> None:
+            nonlocal unsafe_operation_started
+            unsafe_operation_started = True
+            mark_gateway_unsafe(_windows_gateway_resume)
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -9975,24 +10183,44 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             print(f"  ⚠ Currently on {label} — switching to {branch} for update...")
             # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            checkout_result = subprocess.run(
-                git_cmd + ["checkout", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if checkout_result.returncode != 0:
-                # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
-                track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+            try:
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            except BaseException:
+                _mark_update_unsafe()
+                raise
+            try:
+                checkout_result = subprocess.run(
+                    git_cmd + ["checkout", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
+                track_result = None
+                if checkout_result.returncode != 0:
+                    # Local checkout doesn't have this branch yet. Try to set
+                    # it up as a tracking branch of origin/<branch>.
+                    track_result = subprocess.run(
+                        git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+            except OSError:
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                raise
+            except BaseException:
+                # An interrupt may have landed mid-checkout; do not restart a
+                # gateway against an uncertain tree or apply the saved edits.
+                _mark_update_unsafe()
+                raise
+            if track_result is not None:
                 if track_result.returncode != 0:
                     # Restore the user's prior branch + stash before bailing
                     # so we don't leave them stranded in a weird state.
@@ -10009,7 +10237,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            try:
+                auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+            except BaseException:
+                _mark_update_unsafe()
+                raise
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -10017,15 +10249,71 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        restoration_completed = False
+
+        def _restore_checkout_after_safe_failure() -> bool:
+            """Restore pre-update branch/worktree after a non-destructive failure."""
+            nonlocal auto_stash_ref, restoration_completed
+            if current_branch != branch:
+                try:
+                    checkout_result = subprocess.run(
+                        git_cmd + ["checkout", original_checkout_target],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                except BaseException:
+                    _mark_update_unsafe()
+                    raise
+                if checkout_result.returncode != 0:
+                    print(f"  ⚠ Could not restore '{original_checkout_target}'.")
+                    _mark_update_unsafe()
+                    return False
+            if auto_stash_ref is not None:
+                try:
+                    restored = _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                except BaseException:
+                    _mark_update_unsafe()
+                    raise
+                if not restored:
+                    _mark_update_unsafe()
+                    return False
+                auto_stash_ref = None
+            restoration_completed = True
+            return True
+
+        # Check if there are updates. This runs after a possible branch switch
+        # and auto-stash, so every probe failure must restore both before exit.
+        try:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except BaseException:
+            _restore_checkout_after_safe_failure()
+            raise
+        try:
+            commit_count = (
+                int(result.stdout.strip()) if result.returncode == 0 else None
+            )
+        except (AttributeError, ValueError):
+            commit_count = None
+        if commit_count is None:
+            print(f"✗ Could not determine updates on origin/{branch}.")
+            if getattr(result, "stderr", "").strip():
+                print(f"  {result.stderr.strip().splitlines()[0]}")
+            _restore_checkout_after_safe_failure()
+            sys.exit(1)
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -10034,23 +10322,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+            if not _restore_checkout_after_safe_failure():
+                print("  Local changes remain preserved in git stash.")
+                sys.exit(1)
 
             # A current checkout does NOT imply a healthy install: a previous
             # dependency sync may have failed partway (classic on Windows,
@@ -10061,6 +10335,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
+                _mark_update_unsafe()
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
@@ -10093,14 +10368,26 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _install_python_dependencies_with_optional_fallback(
                         [sys.executable, "-m", "pip"], group="all"
                     )
-                _clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
+                    _clear_update_incomplete_marker()
                     print("✓ Dependencies repaired!")
                 else:
+                    _handle_windows_gateway_update_failure(_windows_gateway_resume)
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
+                    sys.exit(1)
+            node_failures = _update_node_dependencies(_windows_gateway_resume)
+            if "Photon sidecar" in node_failures:
+                _handle_windows_gateway_update_failure(_windows_gateway_resume)
+                print()
+                print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+                print(
+                    "  The gateway was not restarted. Fix npm/the sidecar install, "
+                    "then rerun `hermes update`."
+                )
+                sys.exit(1)
+            if healthy:
                 print("✓ Already up to date!")
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
@@ -10115,34 +10402,157 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # every user who ran ``hermes update`` for the 7 minutes between
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
+        rebase_push_remote: Optional[str] = None
+        rebase_backup_sha: Optional[str] = None
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            try:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+            except OSError:
+                _restore_checkout_after_safe_failure()
+                raise
+            except BaseException:
+                # An interrupt may land after git has moved refs or files.
+                _mark_update_unsafe()
+                raise
+            if pull_result.returncode == 0:
+                _mark_update_unsafe()
+            else:
+                # Never use reset --hard until we know this checkout has no
+                # committed local work. A fast-forward failure is normal when a
+                # user keeps local fixes on main; resetting in that case silently
+                # discards those commits.
+                local_ahead_result = subprocess.run(
+                    git_cmd + ["rev-list", f"origin/{branch}..HEAD", "--count"],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                try:
+                    local_ahead = (
+                        int(local_ahead_result.stdout.strip())
+                        if local_ahead_result.returncode == 0
+                        else None
                     )
+                except ValueError:
+                    local_ahead = None
+
+                if local_ahead is None:
+                    print("✗ Fast-forward not possible; preserving committed local work.")
+                    print("  Could not determine whether local commits are ahead of the remote.")
+                    print("  Push or rebase those commits before running `hermes update` again.")
+                    print(f"  Inspect them with: git log --oneline origin/{branch}..HEAD")
+                    _restore_checkout_after_safe_failure()
                     sys.exit(1)
+
+                if local_ahead > 0:
+                    # Never guess a backup destination: pushing to origin/main
+                    # could publish private work or mutate upstream unexpectedly.
+                    push_remote_result = subprocess.run(
+                        git_cmd + ["config", "--get", f"branch.{branch}.pushRemote"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    push_remote = (
+                        push_remote_result.stdout.strip()
+                        if push_remote_result.returncode == 0
+                        else ""
+                    )
+                    if not push_remote:
+                        print("✗ Fast-forward not possible; preserving committed local work.")
+                        print(
+                            f"  This checkout has {local_ahead} local commit(s) not on origin/{branch}."
+                        )
+                        print(
+                            f"  Configure a backup fork first: git config branch.{branch}.pushRemote <remote>"
+                        )
+                        print("  Then run `hermes update` again to back up and rebase them safely.")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    backup_sha = pre_pull_sha or _capture_head_sha(git_cmd, PROJECT_ROOT)
+                    if not backup_sha:
+                        print("✗ Could not capture the local commit ID; update stopped before rebase.")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    print(
+                        f"  → Backing up {local_ahead} local commit(s) to {push_remote}/{branch}..."
+                    )
+                    backup_result = subprocess.run(
+                        git_cmd + ["push", push_remote, f"HEAD:refs/heads/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if backup_result.returncode != 0:
+                        print("✗ Could not back up local commits; update stopped before rebase.")
+                        if backup_result.stderr.strip():
+                            print(f"  {backup_result.stderr.strip()}")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    print(f"  → Rebasing local commits onto origin/{branch}...")
+                    _mark_update_unsafe()
+                    rebase_result = subprocess.run(
+                        git_cmd + ["rebase", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if rebase_result.returncode != 0:
+                        abort_result = subprocess.run(
+                            git_cmd + ["rebase", "--abort"],
+                            cwd=PROJECT_ROOT,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if abort_result.returncode != 0:
+                            print("✗ Rebase conflicted and automatic abort failed.")
+                            if abort_result.stderr.strip():
+                                print(f"  {abort_result.stderr.strip()}")
+                            print(f"  Recover from {push_remote}/{branch} before restarting Hermes.")
+                            sys.exit(1)
+                        print("✗ Rebase conflicted; original local history was restored.")
+                        if rebase_result.stderr.strip():
+                            print(f"  {rebase_result.stderr.strip()}")
+                        print(f"  Backup remains available on {push_remote}/{branch}.")
+                        _restore_checkout_after_safe_failure()
+                        sys.exit(1)
+
+                    # Keep the fork on the immutable pre-rebase history until
+                    # syntax validation passes. The explicit lease below then
+                    # prevents overwriting a concurrent remote update.
+                    rebase_push_remote = push_remote
+                    rebase_backup_sha = backup_sha
+
+                # No committed local work is ahead. This is a rewritten remote
+                # history, so reset is safe and preserves the historical recovery
+                # behavior for managed installs.
+                if local_ahead == 0:
+                    print(
+                        "  ⚠ Fast-forward not possible (remote history diverged), resetting to match remote..."
+                    )
+                    _mark_update_unsafe()
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -10185,20 +10595,72 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print(f"    cd {PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")
                 sys.exit(1)
 
+            if rebase_push_remote and rebase_backup_sha:
+                mirror_result = subprocess.run(
+                    git_cmd
+                    + [
+                        "push",
+                        f"--force-with-lease=refs/heads/{branch}:{rebase_backup_sha}",
+                        rebase_push_remote,
+                        f"HEAD:refs/heads/{branch}",
+                    ],
+                    cwd=PROJECT_ROOT,
+                    capture_output=True,
+                    text=True,
+                )
+                if mirror_result.returncode != 0:
+                    rollback_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", rebase_backup_sha],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if rollback_result.returncode != 0:
+                        print("✗ Backup mirror failed and local rollback also failed.")
+                        if rollback_result.stderr.strip():
+                            print(f"  {rollback_result.stderr.strip()}")
+                        print(
+                            f"  Recover from {rebase_push_remote}/{branch} before restarting Hermes."
+                        )
+                        sys.exit(1)
+                    print("✗ Backup mirror changed concurrently; local rebase was rolled back.")
+                    if mirror_result.stderr.strip():
+                        print(f"  {mirror_result.stderr.strip()}")
+                    _restore_checkout_after_safe_failure()
+                    sys.exit(1)
+                print(
+                    f"  ✓ Local commits rebased and mirrored to {rebase_push_remote}/{branch}."
+                )
+
             update_succeeded = True
+        except OSError:
+            if not restoration_completed and not unsafe_operation_started:
+                _restore_checkout_after_safe_failure()
+            raise
+        except BaseException:
+            if not restoration_completed and not unsafe_operation_started:
+                _restore_checkout_after_safe_failure()
+            elif not restoration_completed:
+                _mark_update_unsafe()
+            raise
         finally:
             if auto_stash_ref is not None:
-                # Don't attempt stash restore if the code update itself failed —
-                # working tree is in an unknown state.
-                if not update_succeeded:
+                # A successful cross-branch update must keep the updated target
+                # checked out through dependency sync and service restart. Keep
+                # the original checkout's edits safely stashed instead of
+                # applying them to the target branch.
+                if not update_succeeded or current_branch != branch:
                     print(
                         f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
                     )
-                    print("  Restore manually with: git stash apply")
+                    if current_branch != branch:
+                        print(
+                            f"  Update remains on '{branch}'; restore '{original_checkout_target}' "
+                            "and its stash manually after the service handoff."
+                        )
+                    else:
+                        print("  Restore manually with: git stash apply")
                 elif discard_local_changes:
-                    # Non-interactive update + user opted into discarding local
-                    # source edits (updates.non_interactive_local_changes:
-                    # discard). Throw the stash away instead of re-applying it.
                     _discard_stashed_changes(
                         git_cmd,
                         PROJECT_ROOT,
@@ -10299,7 +10761,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         _refresh_active_lazy_features()
 
-        node_failures = _update_node_dependencies()
+        node_failures = _update_node_dependencies(_windows_gateway_resume)
+        if "Photon sidecar" in node_failures:
+            _handle_windows_gateway_update_failure(_windows_gateway_resume)
+            print()
+            print("✗ Update stopped: Photon sidecar dependencies are not ready.")
+            print(
+                "  The gateway was not restarted. Fix npm/the sidecar install, "
+                "then rerun `hermes update`."
+            )
+            sys.exit(1)
         _build_web_ui(PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
@@ -11409,13 +11880,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     except subprocess.CalledProcessError as e:
         if sys.platform == "win32":
+            if _windows_gateway_resume and _windows_gateway_resume.get(
+                "unsafe_mutation_started"
+            ):
+                _handle_windows_gateway_update_failure(_windows_gateway_resume)
+                raise
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _run_update_via_zip(args, _windows_gateway_resume)
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+    except BaseException:
+        _handle_windows_gateway_update_failure(_windows_gateway_resume)
+        raise
 
 
 def _coalesce_session_name_args(argv: list) -> list:
