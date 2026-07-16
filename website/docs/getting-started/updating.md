@@ -36,7 +36,10 @@ After a successful rebase, Hermes mirrors the updated branch to its configured
 point. Mirror updates use the remote branch SHA observed immediately before the
 rebase as an explicit Git lease; if another process changes or creates that
 branch meanwhile, the mirror push is rejected and Hermes restores the local
-pre-rebase commit instead of overwriting concurrent work.
+pre-rebase commit instead of overwriting concurrent work. If the configured
+remote has a separate `pushurl`, Hermes observes and pushes to that destination.
+Remotes with multiple push URLs are rejected because one lease cannot safely
+protect a fan-out push.
 
 ### Updating against a non-default branch: `--branch`
 
