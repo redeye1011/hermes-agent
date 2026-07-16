@@ -135,11 +135,6 @@ def check_requirements() -> bool:
         return False
     if not shutil.which(os.getenv("PHOTON_NODE_BIN") or "node"):
         return False
-    if not (_SIDECAR_DIR / "node_modules").exists():
-        # spectrum-ts not installed yet — `hermes photon setup` will
-        # install it.  check_fn still returns False so the gateway
-        # surfaces the missing-deps state in `hermes setup` / status.
-        return False
     return True
 
 
@@ -592,6 +587,17 @@ class PhotonAdapter(BasePlatformAdapter):
         except json.JSONDecodeError:
             logger.debug("[photon] skipping non-JSON inbound line")
             return
+        content = event.get("content") or {}
+        text = content.get("text")
+        if (
+            content.get("type") == "text"
+            and isinstance(text, str)
+            and "\ufffc" in text
+            and not text.replace("\ufffc", "").strip()
+        ):
+            # ponytail: leave this ID un-deduped so a hydrated replay can arrive.
+            logger.info("[photon] suppressing attachment placeholder msg_id=%s", event.get("messageId"))
+            return
         msg_id = event.get("messageId")
         if msg_id and self._is_duplicate(msg_id):
             return
@@ -674,9 +680,18 @@ class PhotonAdapter(BasePlatformAdapter):
         def _normalize_binary_payload(
             payload: Dict[str, Any]
         ) -> tuple[str, MessageType, List[str], List[str]]:
-            is_voice = payload.get("type") == "voice"
-            name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
+            name = payload.get("name") or "(unnamed)"
             mime = payload.get("mimeType") or ""
+            is_native_imessage_voice = (
+                payload.get("type") == "attachment"
+                and name.lower() == "audio message.caf"
+                and mime.strip().lower() in {"", "application/octet-stream"}
+            )
+            is_voice = payload.get("type") == "voice" or is_native_imessage_voice
+            if is_native_imessage_voice:
+                mime = "audio/x-caf"
+            if is_voice and name == "(unnamed)":
+                name = "voice"
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
             cached = _cache_inbound_attachment(
                 payload, name, mime, force_audio=is_voice
@@ -919,24 +934,50 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
     async def _start_sidecar(self) -> None:
-        if not (_SIDECAR_DIR / "node_modules").exists():
+        modules = _SIDECAR_DIR / "node_modules"
+        ffmpeg_binary = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        static_index = modules / "ffmpeg-static" / "index.js"
+        static_binary = modules / "ffmpeg-static" / ffmpeg_binary
+        required_runtime = (
+            modules,
+            modules / "@spectrum-ts" / "imessage" / "dist" / "index.js",
+        )
+        ffmpeg = (
+            str(static_binary)
+            if static_index.exists() and static_binary.exists()
+            else shutil.which("ffmpeg")
+        )
+        deps_missing = not all(path.exists() for path in required_runtime) or not ffmpeg
+        # The updater process that pulls this code may predate the independent
+        # sidecar lockfile. Repair here before the first candidate-side restart.
+        if deps_missing or _sidecar_deps_stale():
+            reason = "missing" if deps_missing else "stale"
+            logger.warning(
+                "[photon] sidecar deps are %s; reinstalling before start", reason
+            )
+            await asyncio.to_thread(_reinstall_sidecar_deps)
+        ffmpeg = (
+            str(static_binary)
+            if static_index.exists() and static_binary.exists()
+            else shutil.which("ffmpeg")
+        )
+        if not all(path.exists() for path in required_runtime) or not ffmpeg:
             raise RuntimeError(
                 f"Photon sidecar deps not installed. Run: "
                 f"cd {_SIDECAR_DIR} && npm install   (or `hermes photon setup`)"
             )
-        # A `hermes update` that bumps the spectrum-ts pin rewrites
-        # package-lock.json but never reinstalls node_modules, so the sidecar
-        # spawns against stale deps and dies on every reconnect (the v8 patch
-        # script can't find @spectrum-ts/imessage/dist that only v8 ships).
-        # Self-heal by reinstalling when the lockfile is newer than npm's
-        # install marker. Runs off the event loop so a cold install can't
-        # freeze every other platform's traffic.
-        if _sidecar_deps_stale():
-            logger.warning(
-                "[photon] sidecar deps are stale (lockfile newer than install); "
-                "reinstalling before start"
+        try:
+            ffmpeg_probe = subprocess.run(  # noqa: S603
+                [ffmpeg, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
             )
-            await asyncio.to_thread(_reinstall_sidecar_deps)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("Photon ffmpeg runtime is unusable") from exc
+        if ffmpeg_probe.returncode != 0:
+            raise RuntimeError("Photon ffmpeg runtime is unusable")
         await self._reap_stale_sidecar()
 
         env = os.environ.copy()
@@ -974,10 +1015,20 @@ class PhotonAdapter(BasePlatformAdapter):
             if patch.stderr.strip():
                 logger.debug("[photon] %s", patch.stderr.strip())
         except Exception as exc:
-            logger.warning(
-                "[photon] failed to apply Spectrum mixed attachment patch: %s",
-                exc,
+            raise RuntimeError(
+                f"Photon Spectrum attachment patch failed: {exc}"
+            ) from exc
+
+        imessage = required_runtime[-1]
+        patched = imessage.read_text(encoding="utf-8")
+        if not all(
+            marker in patched
+            for marker in (
+                "Hermes patch: Preserve mixed text + attachment iMessage payloads",
+                "Hermes patch: Hydrate placeholder-only iMessage attachments v2",
             )
+        ):
+            raise RuntimeError("Photon Spectrum attachment patch markers are missing")
 
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
@@ -1734,10 +1785,13 @@ async def _standalone_send(
                     logger.warning("[photon] standalone send skipping unsafe path")
                     continue
                 guessed, _ = mimetypes.guess_type(safe_path)
+                is_audio = Path(safe_path).suffix.lower() in {
+                    ".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"
+                }
                 att_body: Dict[str, Any] = {
                     "spaceId": chat_id,
                     "path": safe_path,
-                    "kind": "voice" if is_voice else "attachment",
+                    "kind": "voice" if is_voice or is_audio else "attachment",
                 }
                 if guessed:
                     att_body["mimeType"] = guessed

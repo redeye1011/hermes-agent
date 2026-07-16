@@ -224,6 +224,66 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
 
 
 @pytest.mark.asyncio
+async def test_streaming_delivery_routes_photon_bare_mp3_to_native_voice(tmp_path, monkeypatch):
+    """A streamed bare MP3 must not bypass Photon M4A voice conversion."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.mp3")
+    event = MessageEvent(
+        text="make speech",
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform("photon"), chat_id="any;-;+15550000000", chat_type="dm"),
+        message_id="msg-1",
+    )
+    adapter = SimpleNamespace(
+        name="photon",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None), f"Listen here:\n{media_file}", event, adapter
+    )
+
+    adapter.send_voice.assert_awaited_once_with(
+        chat_id="any;-;+15550000000", audio_path=str(media_file), metadata=None
+    )
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_delivery_dedupes_media_tag_and_bare_photon_audio(tmp_path, monkeypatch):
+    """A streamed response must not deliver the same audio tag/path twice."""
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.mp3")
+    event = MessageEvent(
+        text="make speech",
+        message_type=MessageType.TEXT,
+        source=SessionSource(platform=Platform("photon"), chat_id="any;-;+155****0000", chat_type="dm"),
+        message_id="msg-1",
+    )
+    adapter = SimpleNamespace(
+        name="photon",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None), f"MEDIA:{media_file}\n{media_file}", event, adapter
+    )
+
+    adapter.send_voice.assert_awaited_once()
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
     allowed_root = tmp_path / "media-cache"
