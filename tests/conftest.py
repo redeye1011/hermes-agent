@@ -342,6 +342,11 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
+    # Photon plugin discovery can lazily load the developer profile after the
+    # generic cleanup above. An explicit empty sentinel keeps dotenv from
+    # restoring the real home channel; Photon-specific tests opt in explicitly.
+    monkeypatch.setenv("PHOTON_HOME_CHANNEL", "")
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #

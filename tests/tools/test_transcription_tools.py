@@ -811,6 +811,13 @@ class TestValidateAudioFileEdgeCases:
             f.write_bytes(b"data")
             assert _validate_audio_file(str(f)) is None, f"Format {fmt} should be accepted"
 
+    def test_caf_format_is_accepted(self, tmp_path):
+        from tools.transcription_tools import _validate_audio_file
+
+        audio = tmp_path / "Audio Message.caf"
+        audio.write_bytes(b"caff")
+        assert _validate_audio_file(str(audio)) is None
+
     def test_case_insensitive_extension(self, tmp_path):
         from tools.transcription_tools import _validate_audio_file
         f = tmp_path / "test.MP3"
