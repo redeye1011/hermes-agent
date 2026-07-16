@@ -277,6 +277,57 @@ async def test_dispatch_voice_without_bytes_surfaces_marker(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mime_type", ["", "application/octet-stream"])
+async def test_dispatch_native_imessage_caf_attachment_as_voice(
+    monkeypatch: pytest.MonkeyPatch,
+    mime_type: str,
+) -> None:
+    """iMessage's CAF Audio Message must reach the voice pipeline."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    raw = b"caff" + b"\x00" * 32
+
+    await adapter._dispatch_inbound(
+        _attachment_event(
+            {
+                "name": "Audio Message.caf",
+                "mimeType": mime_type,
+                "size": len(raw),
+                "data": base64.b64encode(raw).decode("ascii"),
+                "encoding": "base64",
+            }
+        )
+    )
+
+    ev = captured[0]
+    assert ev.message_type == MessageType.VOICE
+    assert ev.text == "(voice)"
+    assert ev.media_types == ["audio/x-caf"]
+    cached = Path(ev.media_urls[0])
+    try:
+        assert cached.parent.name == "audio"
+        assert cached.suffix == ".caf"
+        assert cached.read_bytes() == raw
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_blank_mime_attachment_remains_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the native iMessage CAF signature is promoted to voice."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    await adapter._dispatch_inbound(
+        _attachment_event({"name": "recording.caf", "mimeType": "", "size": 1})
+    )
+
+    assert captured[0].message_type == MessageType.DOCUMENT
+
+
+@pytest.mark.asyncio
 async def test_dispatch_attachment_downloads_document(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,6 +377,42 @@ async def test_on_inbound_line_dispatches_and_dedups(
 
 
 @pytest.mark.asyncio
+async def test_on_inbound_line_skips_placeholder_before_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A U+FFFC placeholder must not hide a later hydrated CAF event."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    raw = b"caff" + b"\x00" * 32
+
+    await adapter._on_inbound_line(json.dumps(_dm_event("\ufffc", msg_id="voice-race")))
+    await adapter._on_inbound_line(
+        json.dumps(
+            _attachment_event(
+                {
+                    "name": "Audio Message.caf",
+                    "mimeType": "",
+                    "size": len(raw),
+                    "data": base64.b64encode(raw).decode("ascii"),
+                    "encoding": "base64",
+                },
+                msg_id="voice-race",
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.message_type == MessageType.VOICE
+    cached = Path(event.media_urls[0])
+    try:
+        assert cached.suffix == ".caf"
+        assert cached.read_bytes() == raw
+    finally:
+        cached.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 async def test_on_inbound_line_ignores_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
@@ -354,6 +441,19 @@ def test_is_duplicate_hard_size_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(adapter._seen_messages) <= 5
     assert adapter._is_duplicate("id-99") is True  # recent still deduped
     assert adapter._is_duplicate("id-0") is False  # oldest evicted
+
+
+def test_check_requirements_repairs_missing_sidecar_deps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Registry must construct Photon so first-hop startup can run npm repair."""
+    from plugins.platforms.photon import adapter as adapter_mod
+
+    monkeypatch.setattr(adapter_mod, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(adapter_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(adapter_mod, "_SIDECAR_DIR", tmp_path)
+
+    assert adapter_mod.check_requirements() is True
 
 
 def test_check_requirements_without_node(monkeypatch: pytest.MonkeyPatch) -> None:
