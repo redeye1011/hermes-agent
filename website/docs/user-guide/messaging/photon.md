@@ -73,9 +73,10 @@ The setup, in order:
    user with that number already exists, so re-running is safe.
 5. **Prints your assigned iMessage line** — the number you text to reach
    your agent.
-6. **Runs `npm install`** inside the plugin's sidecar directory. On
-   read-only / immutable install trees (hosted Docker images, Podman,
-   Nix) the sidecar automatically falls back to a writable mirror under
+6. **Runs `npm ci`** inside the plugin's sidecar directory, falling back to
+   `npm install` if `npm ci` fails (for example, lockfile drift). On read-only
+   / immutable install trees (hosted Docker images, Podman, Nix) the sidecar
+   automatically falls back to a writable mirror under
    `~/.hermes/photon/sidecar`; set `PHOTON_SIDECAR_DIR` to pin an
    explicit location.
 
