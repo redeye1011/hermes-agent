@@ -172,6 +172,37 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
 
 
 @pytest.mark.asyncio
+async def test_pending_voice_without_echo_does_not_claim_it_was_sent():
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = _runner(adapter)
+    runner._should_echo_stt_transcripts = lambda: False
+    source = _source()
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/telegram-quiet-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "quiet", "provider": "mock"},
+    ):
+        text, transcripts = await runner._transcribe_and_echo_pending_voice(
+            event,
+            adapter,
+            source,
+            "",
+            log_context="test",
+        )
+
+    assert text == '"quiet"'
+    assert transcripts == ["quiet"]
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
     monkeypatch,
     tmp_path,
@@ -215,7 +246,11 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
         )
 
     assert result["final_response"] == "follow-up complete"
-    assert _PendingVoiceAgent.messages == ["initial turn", '"hello once"']
+    assert _PendingVoiceAgent.messages == [
+        "initial turn",
+        '"hello once"\n\n[The transcript above was already sent to the user. '
+        "Reply to it without repeating it.]",
+    ]
     mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg")
     assert adapter.sent == [("12345", '🎙️ "hello once"', None)]
 
@@ -265,9 +300,13 @@ async def test_busy_voice_interrupt_transcribes_before_pending_drain(monkeypatch
         )
 
     assert handled is True
-    agent.interrupt.assert_called_once_with('"interrupt me"')
+    echoed_interrupt = (
+        '"interrupt me"\n\n[The transcript above was already sent to the user. '
+        "Reply to it without repeating it.]"
+    )
+    agent.interrupt.assert_called_once_with(echoed_interrupt)
     assert adapter._pending_messages[session_key] is event
-    assert drain_text == '"interrupt me"'
+    assert drain_text == echoed_interrupt
     mock_transcribe.assert_called_once_with("/tmp/telegram-busy-voice.ogg")
     adapter.send.assert_awaited_once_with(
         "12345",
