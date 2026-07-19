@@ -2343,6 +2343,10 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
+_TRANSCRIPT_ECHO_MARKER = (
+    "\n\n[The transcript above was already sent to the user. "
+    "Reply to it without repeating it.]"
+)
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -12428,6 +12432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
+                _all_transcripts_echoed = bool(_successful_transcripts)
                 if _successful_transcripts and self._should_echo_stt_transcripts():
                     _echo_adapter = self._adapter_for_source(source)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -12440,9 +12445,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     metadata=_echo_meta,
                                 )
                             except Exception as _echo_exc:
+                                _all_transcripts_echoed = False
                                 logger.debug(
                                     "Transcript echo failed (non-fatal): %s", _echo_exc,
                                 )
+                    else:
+                        _all_transcripts_echoed = False
+                else:
+                    _all_transcripts_echoed = False
+                if _all_transcripts_echoed:
+                    message_text += _TRANSCRIPT_ECHO_MARKER
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -17565,12 +17577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
-                    # ponytail: transcript is echoed separately; avoid sending it twice.
-                    enriched_parts.append(
-                        f'"{transcript}"\n\n'
-                        "[The transcript above was already sent to the user. "
-                        "Reply to it without repeating it.]"
-                    )
+                    enriched_parts.append(f'"{transcript}"')
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
@@ -17648,25 +17655,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         metadata=None,
         log_context: str = "Transcript",
-    ) -> None:
+    ) -> bool:
         """Echo pending-event STT transcripts to the chat at most once."""
-        if (
-            not transcripts
-            or not self._should_echo_stt_transcripts()
-            or adapter is None
-            or getattr(event, "_gateway_pending_stt_echo_sent", False)
-        ):
-            return
-        setattr(event, "_gateway_pending_stt_echo_sent", True)
-        for tx in transcripts:
-            try:
-                await adapter.send(
-                    source.chat_id,
-                    f'🎙️ "{tx}"',
-                    metadata=metadata,
-                )
-            except Exception as echo_exc:
-                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+        lock = getattr(event, "_gateway_pending_stt_echo_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            setattr(event, "_gateway_pending_stt_echo_lock", lock)
+        async with lock:
+            if getattr(event, "_gateway_pending_stt_echo_sent", False):
+                return bool(getattr(event, "_gateway_pending_stt_echo_complete", False))
+            if (
+                not transcripts
+                or not self._should_echo_stt_transcripts()
+                or adapter is None
+            ):
+                return False
+            setattr(event, "_gateway_pending_stt_echo_sent", True)
+            complete = True
+            for tx in transcripts:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f'🎙️ "{tx}"',
+                        metadata=metadata,
+                    )
+                except Exception as echo_exc:
+                    complete = False
+                    logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+            setattr(event, "_gateway_pending_stt_echo_complete", complete)
+            return complete
 
     async def _transcribe_and_echo_pending_voice(
         self,
@@ -17700,7 +17717,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source,
                 self._reply_anchor_for_event(event),
             ) if metadata is _UNSET else metadata
-            await self._echo_pending_stt_transcripts_once(
+            echoed = await self._echo_pending_stt_transcripts_once(
                 event,
                 adapter,
                 source,
@@ -17708,6 +17725,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=echo_meta,
                 log_context=log_context,
             )
+            if echoed:
+                enriched_text = enriched_text or text
+                if not enriched_text.endswith(_TRANSCRIPT_ECHO_MARKER):
+                    enriched_text += _TRANSCRIPT_ECHO_MARKER
+                    setattr(event, "_gateway_pending_stt_text", enriched_text)
             return enriched_text or text, transcripts
         except Exception as trans_exc:
             logger.warning("%s transcription failed: %s", log_context, trans_exc)
