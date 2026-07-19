@@ -725,9 +725,13 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
-                result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
-                if not result.success:
-                    return {"error": f"Adapter send failed: {result.error}"}
+                result = None
+                if chunk:
+                    result = await adapter.send(
+                        chat_id=chat_id, content=chunk, metadata=metadata
+                    )
+                    if not result.success:
+                        return {"error": f"Adapter send failed: {result.error}"}
                 if media_files:
                     from gateway.platforms.base import should_send_media_as_audio
 
@@ -745,6 +749,9 @@ async def _send_via_adapter(
                             )
                         if not media_result.success:
                             return {"error": f"Adapter media send failed: {media_result.error}"}
+                        result = media_result
+                if result is None:
+                    return {"error": "Adapter send had no text or media to deliver"}
                 return {"success": True, "message_id": result.message_id}
             except asyncio.CancelledError:
                 raise
