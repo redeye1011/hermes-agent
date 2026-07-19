@@ -66,3 +66,35 @@ def test_live_photon_adapter_sends_text_then_native_audio(monkeypatch) -> None:
         chat_id="any;-;+15550000000", audio_path="/tmp/reply.mp3", metadata=None
     )
     adapter.send_document.assert_not_awaited()
+
+
+def test_live_photon_adapter_sends_media_without_empty_text(monkeypatch) -> None:
+    """A MEDIA-only send must not create or fail on an empty iMessage bubble."""
+    text_success = SimpleNamespace(success=True, message_id="text-1", error=None)
+    media_success = SimpleNamespace(success=True, message_id="media-1", error=None)
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=text_success),
+        send_voice=AsyncMock(return_value=media_success),
+        send_document=AsyncMock(return_value=media_success),
+    )
+    photon = Platform("photon")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(adapters={photon: adapter}),
+    )
+
+    result = asyncio.run(
+        _send_via_adapter(
+            photon,
+            SimpleNamespace(enabled=True, token="", extra={}),
+            "any;-;+155****0000",
+            "",
+            media_files=[("/tmp/reply.mp3", True)],
+        )
+    )
+
+    assert result == {"success": True, "message_id": "media-1"}
+    adapter.send.assert_not_awaited()
+    adapter.send_voice.assert_awaited_once_with(
+        chat_id="any;-;+155****0000", audio_path="/tmp/reply.mp3", metadata=None
+    )
