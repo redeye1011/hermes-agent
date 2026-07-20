@@ -1211,8 +1211,12 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
-            # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            # Match the interactive backup: exclude only the root code checkout,
+            # not nested skill directories that happen to be named hermes-agent.
+            dirnames[:] = [
+                d for d in dirnames
+                if not _should_exclude((dp / d).relative_to(hermes_root))
+            ]
 
             for fname in filenames:
                 fpath = dp / fname
