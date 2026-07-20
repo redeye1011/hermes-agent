@@ -43,7 +43,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # pytest, pytest-asyncio, pytest-timeout, ruff, ty).
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  # ponytail: runtime-only venvs are valid installs, but not test runners.
+  if [ -x "$candidate/bin/python" ] \
+      && "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
     VENV="$candidate"
     break
   fi
