@@ -2067,6 +2067,20 @@ class TestPreUpdateBackup:
         # pid files excluded
         assert "gateway.pid" not in names
 
+    def test_includes_nested_hermes_agent_skill(self, hermes_home):
+        from hermes_cli.backup import create_pre_update_backup
+
+        nested = hermes_home / "skills" / "autonomous-ai-agents" / "hermes-agent"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text("# Hermes Agent Skill\n")
+
+        out = create_pre_update_backup(hermes_home=hermes_home)
+        assert out is not None
+        with zipfile.ZipFile(out) as zf:
+            names = set(zf.namelist())
+        assert "skills/autonomous-ai-agents/hermes-agent/SKILL.md" in names
+        assert not any(name.startswith("hermes-agent/") for name in names)
+
     def test_does_not_recurse_into_prior_backups(self, hermes_home):
         """The ``backups/`` directory must be excluded so that each backup
         doesn't grow exponentially by including all prior backups."""
