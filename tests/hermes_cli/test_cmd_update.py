@@ -1874,7 +1874,7 @@ def test_configured_windows_sidecar_failure_unregisters_gateway_resume(tmp_path,
     monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
     token = {"resume_needed": True}
     monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
-    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         hm, "_update_node_dependencies", lambda *_args: ["Photon sidecar"]
     )
@@ -1907,7 +1907,7 @@ def test_windows_update_exception_suppresses_gateway_resume(tmp_path, monkeypatc
     monkeypatch.setattr(hm, "_run_pre_update_backup", lambda args: None)
     token = {"resume_needed": True}
     monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: token)
-    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(hm.subprocess, "run", _make_run_side_effect(commit_count="1"))
 
     def interrupted_update(*_args):
