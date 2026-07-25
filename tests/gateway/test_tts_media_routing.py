@@ -224,8 +224,8 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
 
 
 @pytest.mark.asyncio
-async def test_streaming_delivery_routes_photon_bare_mp3_to_native_voice(tmp_path, monkeypatch):
-    """A streamed bare MP3 must not bypass Photon M4A voice conversion."""
+async def test_streaming_delivery_routes_photon_mp3_media_tag_to_native_voice(tmp_path, monkeypatch):
+    """A streamed Photon MP3 MEDIA tag must route through native voice delivery."""
     media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.mp3")
     event = MessageEvent(
         text="make speech",
@@ -245,7 +245,7 @@ async def test_streaming_delivery_routes_photon_bare_mp3_to_native_voice(tmp_pat
     )
 
     await GatewayRunner._deliver_media_from_response(
-        _fake_runner(None), f"Listen here:\n{media_file}", event, adapter
+        _fake_runner(None), f"Listen here:\nMEDIA:{media_file}", event, adapter
     )
 
     adapter.send_voice.assert_awaited_once_with(
