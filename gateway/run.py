@@ -14077,6 +14077,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Collect MEDIA paths already in history so the streaming-delivery
+            # branch below can exclude them from this turn's extraction (the
+            # model may echo a previous turn's MEDIA: tag). Mirrors the same
+            # computation in _run_agent_inner for the non-streaming path.
+            _history_media_paths: set = _collect_history_media_paths(history)
+
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
