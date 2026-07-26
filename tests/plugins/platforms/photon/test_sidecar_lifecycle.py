@@ -223,7 +223,18 @@ async def test_start_sidecar_cold_installs_missing_deps(
 
     def _fake_install() -> None:
         installs.append("ran")
-        (tmp_path / "node_modules" / "spectrum-ts").mkdir(parents=True)
+        modules = tmp_path / "node_modules"
+        (modules / "spectrum-ts").mkdir(parents=True, exist_ok=True)
+        static = modules / "ffmpeg-static"
+        static.mkdir(parents=True, exist_ok=True)
+        (static / "index.js").write_text("")
+        (static / ("ffmpeg.exe" if photon_adapter.sys.platform == "win32" else "ffmpeg")).write_text("")
+        imessage = modules / "@spectrum-ts" / "imessage" / "dist" / "index.js"
+        imessage.parent.mkdir(parents=True, exist_ok=True)
+        imessage.write_text(
+            "Hermes patch: Preserve mixed text + attachment iMessage payloads\n"
+            "Hermes patch: Hydrate placeholder-only iMessage attachments v2\n"
+        )
 
     monkeypatch.setattr(photon_adapter, "_reinstall_sidecar_deps", _fake_install)
 

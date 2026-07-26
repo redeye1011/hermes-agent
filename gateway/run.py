@@ -14569,6 +14569,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Collect MEDIA paths already in history so the streaming-delivery
+            # branch below can exclude them from this turn's extraction (the
+            # model may echo a previous turn's MEDIA: tag). Mirrors the same
+            # computation in _run_agent_inner for the non-streaming path.
+            _history_media_paths: set = _collect_history_media_paths(history)
+
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
             # below; a /new or another lifecycle transition may move
@@ -15197,7 +15203,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            history_media_paths=_collect_history_media_paths(history),
+                            history_media_paths=_history_media_paths,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
