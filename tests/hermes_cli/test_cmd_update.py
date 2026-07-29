@@ -1944,7 +1944,7 @@ def test_windows_interrupted_pull_suppresses_gateway_resume(tmp_path, monkeypatc
     base_run = _make_run_side_effect(commit_count="1")
 
     def interrupted_pull(cmd, **kwargs):
-        if "pull" in cmd:
+        if "merge" in cmd or "pull" in cmd:
             raise KeyboardInterrupt
         return base_run(cmd, **kwargs)
 

@@ -963,7 +963,7 @@ def test_cmd_update_restores_checkout_when_pull_spawn_fails(monkeypatch, tmp_pat
     )
 
     def failed_pull_spawn(cmd, **kwargs):
-        if "pull" in cmd:
+        if "merge" in cmd or "pull" in cmd:
             raise OSError("git unavailable")
         return side_effect(cmd, **kwargs)
 
